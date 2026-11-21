@@ -10,17 +10,20 @@
 
 #include "nccl.h"
 #include "checks.h"
+#include "device_env.h"
 
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <mutex>
+#include <condition_variable>
 
 // ncclCudaContext: wraps a CUDA context with per-context state.
 struct ncclCudaContext;
 
 // Get a ncclCudaContext to track the currently active CUDA context.
-ncclResult_t ncclCudaContextTrack(struct ncclCudaContext** out, int launchOrderImplicit, uint64_t commHash);
+ncclResult_t ncclCudaContextTrack(struct ncclCudaContext** out, int launchOrderImplicit, uint64_t commHash,
+                                  const struct ncclDeviceFacts* facts);
 // Drop reference.
 void ncclCudaContextDrop(struct ncclCudaContext* cxt);
 
@@ -132,6 +135,13 @@ struct ncclCudaContext {
   struct ncclCudaContext* next;
   CUcontext hcontext;
   int refCount;
+  // ContextEnv: the current CUDA context remains owned by the caller/runtime.
+  const struct ncclDeviceFacts* facts;
+  enum InitState { Initializing, Ready, Failed } initState;
+  ncclResult_t initResult;
+  std::mutex initMutex;
+  std::condition_variable initCond;
+  struct ncclKernelInfo kernels;
   bool launchOrderImplicitEverEnabled;
   bool launchOrderImplicitEverDisabled;
   struct ncclStrongStream launchOrder;

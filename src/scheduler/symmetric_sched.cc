@@ -327,7 +327,7 @@ static ncclResult_t ncclSymmetricTaskSchedulerImpl(
   }
   void** kernelList = Genk ? ncclGenkKernelList : ncclSymkKernelList;
   void** kernelListProfile = Genk ? ncclGenkKernelListProfile : ncclSymkKernelListProfile;
-  int* kernelMaxDynamicSmem = Genk ? ncclGenkKernelMaxDynamicSmem : ncclSymkKernelMaxDynamicSmem;
+  int* kernelMaxDynamicSmem = Genk ? comm->context->kernels.genMaxDynamicSmem : comm->context->kernels.symMaxDynamicSmem;
   // Profiling requested = plugin loaded and mask has ncclProfileKernelCh. Set
   // hasProfilerOps (like non-sym plans) so the host callback fires the group/coll events.
   bool profilingRequested = ncclProfilerPluginLoaded() && (headTask->eActivationMask & ncclProfileKernelCh);

@@ -333,10 +333,6 @@ with open(os.path.join(gensrc, "sym_kernels_host.cc"), "w") as f:
   emitln(f, '};')
   emitln(f, '')
 
-  emitln(f, 'int ncclSymkKernelMaxDynamicSmem[%d];' % len(kernel_list))
-  emitln(f, 'int ncclSymkKernelMaxThreads[%d];' % len(kernel_list))
-  emitln(f, '')
-
   emitln(f, 'int ncclSymkGetKernelIndex(ncclSymkKernelId id, int red, ncclDataType_t ty) {')
   indents += 1
   emitln(f, 'switch (id) {')

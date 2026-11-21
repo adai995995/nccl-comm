@@ -264,9 +264,6 @@ def generate(gensrc):
     emitln(f, '};')
     emitln(f, '')
 
-    emitln(f, 'int ncclGenkKernelMaxDynamicSmem[%d];' % max(len(kernels), 1))
-    emitln(f, '')
-
     emitln(f, 'int ncclGenkGetKernelIndex(ncclSymkKernelId id, int red, ncclDataType_t ty) {')
     indents += 1
     if kernels:

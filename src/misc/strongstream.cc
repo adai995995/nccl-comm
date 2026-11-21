@@ -9,6 +9,7 @@
 #include "cudawrap.h"
 #include "checks.h"
 #include "param.h"
+#include "enqueue.h"
 #include <mutex>
 #include <memory>
 
@@ -32,31 +33,49 @@ struct ncclStrongStreamCapture {
 static ncclCudaContext* cxtListHead = nullptr;
 static std::mutex cxtListMutex;
 
+int64_t ncclParamSetStackSize();
+
+static ncclResult_t contextEnvInit(ncclCudaContext* cxt) {
+  NCCLCHECK(ncclInitKernelsForDevice(cxt->facts, &cxt->kernels));
+  if (cxt->kernels.maxStackBytes > 0 && ncclParamSetStackSize() == 1) {
+    CUDACHECKIGNORE(cudaDeviceSetLimit(cudaLimitStackSize, cxt->kernels.maxStackBytes));
+  }
+  NCCLCHECK(ncclStrongStreamConstruct(&cxt->launchOrder));
+  INFO(NCCL_INIT, "ContextEnv: initialized context %p cudaDev %d", cxt->hcontext, cxt->facts->cudaDev);
+  return ncclSuccess;
+}
+
 static int launchOrderImplicitEffective(int launchOrderImplicit) {
   return launchOrderImplicit == 1 ? 1 : 0;
 }
 
-ncclResult_t ncclCudaContextTrack(struct ncclCudaContext** out, int launchOrderImplicit, uint64_t commHash) {
-  ncclResult_t result = ncclSuccess;
+ncclResult_t ncclCudaContextTrack(struct ncclCudaContext** out, int launchOrderImplicit, uint64_t commHash,
+                                  const ncclDeviceFacts* facts) {
+  *out = nullptr;
   CUcontext hcontext;
   CUCHECK(cuCtxGetCurrent(&hcontext));
+  if (hcontext == nullptr) return ncclInvalidUsage;
   int launchOrderImplicitEnabled = launchOrderImplicitEffective(launchOrderImplicit);
 
-  std::lock_guard<std::mutex> lock(cxtListMutex);
+  std::unique_lock<std::mutex> lock(cxtListMutex);
   struct ncclCudaContext* p = cxtListHead;
+  bool initialize = false;
   while (1) {
     if (p == nullptr) {
-      p = new ncclCudaContext{};
+      NEW_NOTHROW(p, ncclCudaContext);
       p->refCount = 1;
       p->hcontext = hcontext;
+      p->facts = facts;
+      p->initState = ncclCudaContext::Initializing;
       p->launchOrderImplicitEverEnabled = launchOrderImplicitEnabled;
       p->launchOrderImplicitEverDisabled = !launchOrderImplicitEnabled;
       p->next = cxtListHead;
       cxtListHead = p;
-      NCCLCHECKGOTO(ncclStrongStreamConstruct(&p->launchOrder), result, leave);
+      initialize = true;
       break;
     }
     if (p->hcontext == hcontext) {
+      if (p->facts != facts) return ncclInvalidUsage;
       if (launchOrderImplicitEnabled ? p->launchOrderImplicitEverDisabled : p->launchOrderImplicitEverEnabled) {
         INFO(NCCL_INIT,
              "commHash 0x%lx uses config launchOrderImplicit=%d after this CUDA context used the opposite value. "
@@ -70,19 +89,53 @@ ncclResult_t ncclCudaContextTrack(struct ncclCudaContext** out, int launchOrderI
     }
     p = p->next;
   }
-leave:
+  lock.unlock();
+
+  // Reserve a reference before waiting, but never hold the registry lock during
+  // CUDA initialization. Independent contexts can initialize concurrently.
+  ncclResult_t result;
+  if (initialize) {
+    result = contextEnvInit(p);
+    {
+      std::lock_guard<std::mutex> initLock(p->initMutex);
+      p->initResult = result;
+      p->initState = result == ncclSuccess ? ncclCudaContext::Ready : ncclCudaContext::Failed;
+    }
+    p->initCond.notify_all();
+  } else {
+    std::unique_lock<std::mutex> initLock(p->initMutex);
+    p->initCond.wait(initLock, [p] { return p->initState != ncclCudaContext::Initializing; });
+    result = p->initResult;
+  }
+  if (result != ncclSuccess) {
+    ncclCudaContextDrop(p);
+    return result;
+  }
   *out = p;
   return ncclSuccess;
 }
 
 void ncclCudaContextDrop(struct ncclCudaContext* cxt) {
-  std::lock_guard<std::mutex> lock(cxtListMutex);
+  std::unique_lock<std::mutex> lock(cxtListMutex);
   if (0 == --cxt->refCount) {
     struct ncclCudaContext** pp = &cxtListHead;
     while (*pp != cxt) pp = &(*pp)->next;
     *pp = cxt->next; // remove from list
+    lock.unlock();
     // Destroy resources held in cxt
-    ncclStrongStreamDestruct(&cxt->launchOrder);
+    if (cxt->initState == ncclCudaContext::Ready) {
+      ncclStrongStreamDestruct(&cxt->launchOrder);
+    } else {
+      // Construction can fail between creating the stream and its event.
+      if (cxt->launchOrder.liveStream) CUDACHECKIGNORE(cudaStreamDestroy(cxt->launchOrder.liveStream));
+#if CUDART_VERSION >= 11030
+      if (cxt->launchOrder.serialEvent) CUDACHECKIGNORE(cudaEventDestroy(cxt->launchOrder.serialEvent));
+#endif
+    }
+    free(cxt->kernels.symMaxDynamicSmem);
+    free(cxt->kernels.symMaxThreads);
+    free(cxt->kernels.genMaxDynamicSmem);
+    INFO(NCCL_INIT, "ContextEnv: released context %p cudaDev %d", cxt->hcontext, cxt->facts->cudaDev);
     delete cxt;
   }
 }

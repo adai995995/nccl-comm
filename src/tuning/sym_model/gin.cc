@@ -199,7 +199,7 @@ ncclResult_t ncclSymkGinModel(struct ncclTuningInput_t* input, enum ncclSymkKern
       int lsaRanks = ncclTeamLsa(comm).nRanks;
       int lsaPeerCount = std::max(0, lsaRanks - 1);
       int ginPeerCount = comm->nRanks - lsaRanks;
-      int warpsPerBlock = ncclSymkKernelMaxWarps(kernelId, input->devRedOp, input->datatype);
+      int warpsPerBlock = ncclSymkKernelMaxWarps(comm, kernelId, input->devRedOp, input->datatype);
       int ginLinesPerWarp = ncclSymkAlltoAllLLGinLinesPerWarp(payloadBytes);
       *nBlocks =
         ncclSymkAlltoAllLLSelectedBlockCount(lsaPeerCount, ginPeerCount, payloadBytes,

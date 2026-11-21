@@ -149,9 +149,9 @@ ncclSymkKernelMask ncclSymkNonGenkKernelMask() {
   return kernelMask_Symk;
 }
 
-int ncclSymkKernelMaxWarps(ncclSymkKernelId kernelId, int red, ncclDataType_t ty) {
+int ncclSymkKernelMaxWarps(struct ncclComm* comm, ncclSymkKernelId kernelId, int red, ncclDataType_t ty) {
   int kernelIndex = ncclSymkGetKernelIndex(kernelId, red, ty);
-  int maxThreads = kernelIndex < 0 ? 0 : ncclSymkKernelMaxThreads[kernelIndex];
+  int maxThreads = kernelIndex < 0 ? 0 : comm->context->kernels.symMaxThreads[kernelIndex];
   if (maxThreads <= 0) maxThreads = ncclSymkMaxThreads;
   return std::max(1, maxThreads / WARP_SIZE);
 }
@@ -159,14 +159,14 @@ int ncclSymkKernelMaxWarps(ncclSymkKernelId kernelId, int red, ncclDataType_t ty
 // Return a device-specific grid limit at which every CTA of this exact kernel
 // can be resident. Use the lower occupancy of the normal and instrumented
 // variants because either may be selected after tuning.
-static ncclResult_t ncclSymkKernelMaxResidentCtas(ncclSymkKernelId kernelId, int red, ncclDataType_t ty,
+static ncclResult_t ncclSymkKernelMaxResidentCtas(struct ncclComm* comm, ncclSymkKernelId kernelId, int red, ncclDataType_t ty,
                                                   int* maxResidentCtas) {
   *maxResidentCtas = 1;
 #if !defined(NCCL_OS_WINDOWS)
   int kernelIndex = ncclSymkGetKernelIndex(kernelId, red, ty);
   if (kernelIndex < 0 || ncclSymkKernelList[kernelIndex] == nullptr) return ncclSuccess;
 
-  int threads = ncclSymkKernelMaxThreads[kernelIndex];
+  int threads = comm->context->kernels.symMaxThreads[kernelIndex];
   if (threads <= 0) threads = ncclSymkMaxThreads;
 
   int blocksPerSmLimit = 0;
@@ -355,7 +355,7 @@ ncclResult_t ncclSymkInitOnce(struct ncclComm* comm) {
   if (!symk->initialized) {
     bool alltoAllLLForced = ncclSymkAlltoAllLLForced(comm);
     if (alltoAllLLForced) {
-      NCCLCHECK(ncclSymkKernelMaxResidentCtas(ncclSymkKernelId_AlltoAll_LL, /*red=*/0, ncclUint8,
+      NCCLCHECK(ncclSymkKernelMaxResidentCtas(comm, ncclSymkKernelId_AlltoAll_LL, /*red=*/0, ncclUint8,
                                               &symk->alltoAllLLMaxResidentCtas));
     }
 
@@ -634,7 +634,8 @@ int ncclSymkMaxChunkElts(struct ncclComm* comm, ncclSymkKernelId kernelId, int /
   bool isGenk = 1 & (kernelMask_Genk >> (int)kernelId);
   int kernelIndex = isGenk ? ncclGenkGetKernelIndex(kernelId, red, ty) : ncclSymkGetKernelIndex(kernelId, red, ty);
   if (kernelIndex < 0) return 0;
-  int maxDynamicSmem = isGenk ? ncclGenkKernelMaxDynamicSmem[kernelIndex] : ncclSymkKernelMaxDynamicSmem[kernelIndex];
+  int maxDynamicSmem = isGenk ? comm->context->kernels.genMaxDynamicSmem[kernelIndex] :
+                                comm->context->kernels.symMaxDynamicSmem[kernelIndex];
   return maxDynamicSmem / (eltSize * accMult);
 }
 

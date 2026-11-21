@@ -472,23 +472,11 @@ NCCL_PARAM(DmaBufEnable, "DMABUF_ENABLE", 1);
 
 // Detect DMA-BUF support
 static ncclResult_t dmaBufSupported(struct ncclComm* comm) {
-  if (ncclParamDmaBufEnable() == 0 || comm->ncclNet->regMrDmaBuf == NULL || ncclCudaLibraryInit() != ncclSuccess) {
+  if (ncclParamDmaBufEnable() == 0 || comm->ncclNet->regMrDmaBuf == NULL || !comm->deviceFacts->dmaBufSupport) {
     return ncclInternalError;
   }
-#if CUDA_VERSION >= 11070
-  int flag = 0;
-  CUdevice dev;
-  int cudaDriverVersion;
-  CUDACHECK(cudaDriverGetVersion(&cudaDriverVersion));
-  if (CUPFN(cuDeviceGet) == NULL || cudaDriverVersion < 11070) return ncclInternalError;
-  CUCHECK(cuDeviceGet(&dev, comm->cudaDev));
-  // Query device to see if DMA-BUF support is available
-  (void)CUPFN(cuDeviceGetAttribute(&flag, CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED, dev));
-  if (flag == 0) return ncclInternalError;
   INFO(NCCL_INIT, "DMA-BUF is available on GPU device %d", comm->cudaDev);
   return ncclSuccess;
-#endif
-  return ncclInternalError;
 }
 
 ncclResult_t ncclCommEnsureReady(ncclComm_t comm) {
@@ -510,7 +498,8 @@ exit:
   return ret;
 }
 
-static ncclResult_t commAlloc(struct ncclComm* comm, struct ncclComm* parent, int ndev, int rank) {
+static ncclResult_t commAlloc(struct ncclComm* comm, struct ncclComm* parent, int ndev, int rank,
+                               uint64_t* kernelTime) {
   if (ndev < 1) {
     WARN("invalid device count (%d) requested", ndev);
     return ncclInvalidArgument;
@@ -529,7 +518,20 @@ static ncclResult_t commAlloc(struct ncclComm* comm, struct ncclComm* parent, in
   // Try to create a CUDA object right away. If there is something wrong with
   // the device we're on (failure cause #1) , better know it early.
   CUDACHECK(cudaGetDevice(&comm->cudaDev));
-  comm->compCap = ncclCudaCompCap();
+  // On older runtimes cudaSetDevice alone need not make a context current on
+  // this async initialization thread. ContextEnv needs its actual CUcontext.
+  CUDACHECK(cudaFree(nullptr));
+  NCCLCHECK(ncclDeviceFactsGet(comm->cudaDev, &comm->deviceFacts));
+  comm->compCap = comm->deviceFacts->compCap;
+  comm->cudaArch = comm->deviceFacts->cudaArch;
+  comm->maxSharedMemOptin = comm->deviceFacts->maxSharedMemOptin;
+  comm->busId = comm->deviceFacts->busId;
+  comm->nvmlDev = comm->deviceFacts->nvmlDev;
+  uint64_t kernelStart = clockNano();
+  ncclResult_t contextResult = ncclCudaContextTrack(&comm->context, comm->config.launchOrderImplicit, comm->commHash,
+                                                   comm->deviceFacts);
+  *kernelTime = clockNano() - kernelStart;
+  NCCLCHECK(contextResult);
 
   if (parent == NULL || !parent->shareResources) {
     struct ncclSharedResources* sharedRes;
@@ -576,15 +578,6 @@ static ncclResult_t commAlloc(struct ncclComm* comm, struct ncclComm* parent, in
     // Create new memory manager
     NCCLCHECK(ncclMemManagerInit(comm));
   }
-
-  NCCLCHECK(ncclCudaContextTrack(&comm->context, comm->config.launchOrderImplicit, comm->commHash));
-
-  NCCLCHECK(getBusId(comm->cudaDev, &comm->busId));
-  nvmlDevice_t nvmlDev;
-  char busId[NVML_DEVICE_PCI_BUS_ID_BUFFER_SIZE];
-  NCCLCHECK(int64ToBusId(comm->busId, busId));
-  NCCLCHECK(ncclNvmlDeviceGetHandleByPciBusId(busId, &nvmlDev));
-  NCCLCHECK(ncclNvmlDeviceGetIndex(nvmlDev, (unsigned int*)&comm->nvmlDev));
 
   TRACE(NCCL_INIT, "comm %p rank %d nranks %d cudaDev %d busId %lx compCap %d", comm, rank, ndev, comm->cudaDev,
         comm->busId, comm->compCap);
@@ -888,7 +881,7 @@ static const char* mnnvlDegradedBwStr(unsigned int healthMask) {
 }
 
 static ncclResult_t fillInfo(struct ncclComm* comm, struct ncclPeerInfo* info, uint64_t commHash) {
-  cudaDeviceProp prop;
+  const ncclDeviceFacts* facts = comm->deviceFacts;
   info->rank = comm->rank;
   info->cudaDev = comm->cudaDev;
   info->nvmlDev = comm->nvmlDev;
@@ -899,18 +892,13 @@ static ncclResult_t fillInfo(struct ncclComm* comm, struct ncclPeerInfo* info, u
   info->pidHash = getPidHash() + commHash;
   info->cuMemSupport = ncclCuMemEnable();
   info->cuMemHostSupport = info->cuMemSupport && ncclCuMemHostEnable();
-  info->fabricHandleSupport = 0;
+  info->fabricHandleSupport = facts->fabricHandleSupport;
   CUdevice currentDev;
   CUCHECK(cuDeviceGet(&currentDev, comm->cudaDev));
   NCCLCHECK(ncclGpuGetCliqueIds(currentDev, &info->cftUnicastCliqueId, &info->cftMulticastCliqueId));
-  // Ignore the error when CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED is unavailable.
-  (void)CUPFN(cuDeviceGetAttribute(&info->fabricHandleSupport, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
-                                   currentDev));
-  CUDACHECK(cudaGetDeviceProperties(&prop, comm->cudaDev));
-  info->totalGlobalMem = ROUNDUP(prop.totalGlobalMem, (1ULL << 32));
-  NCCLCHECK(ncclCudaDriverVersion(&info->cudaDriverVersion));
-  const char* mlopartStr = strstr(prop.name, "MLOPart");
-  info->mloPart = mlopartStr ? atoi(mlopartStr + strlen("MLOPart")) : NCCL_TOPO_UNDEF;
+  info->totalGlobalMem = ROUNDUP(facts->totalGlobalMem, (1ULL << 32));
+  info->cudaDriverVersion = facts->driverVersion;
+  info->mloPart = facts->mloPart;
 
   // Get the device MAJOR:MINOR of /dev/shm so we can use that
   // information to decide whether we can use SHM for inter-process
@@ -925,9 +913,10 @@ static ncclResult_t fillInfo(struct ncclComm* comm, struct ncclPeerInfo* info, u
   info->shmDev = statbuf.st_dev;
 #endif
   info->busId = comm->busId;
-  CUCHECK(cuDeviceGetUuid((CUuuid*)&info->gpuUuid, currentDev));
+  info->gpuUuid = facts->gpuUuid;
 
-  NCCLCHECK(ncclGpuGdrSupport(comm, &info->gdrSupport));
+  if (facts->gdrSupport >= 0) info->gdrSupport = facts->gdrSupport;
+  else NCCLCHECK(ncclGpuGdrSupport(comm, &info->gdrSupport));
   NCCLCHECK(ncclGpuCftSupport(comm, &info->gpuCftSupport, &info->gpuCftMulticastSupport, &info->gpuCftCountedSupport));
   info->comm = comm;
   info->cudaCompCap = comm->minCompCap = comm->maxCompCap = comm->compCap;
@@ -2222,32 +2211,14 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   struct ncclCommInitRankAsyncJob* job = (struct ncclCommInitRankAsyncJob*)job_;
   ncclComm_t comm = job->comm;
   ncclResult_t res = ncclSuccess;
-  int archMajor, archMinor;
-  size_t maxLocalSizeBytes = 0;
   int cudaDev = job->cudaDev;
   int* parentRanks = NULL;
-  int cudaArch;
-  int maxSharedMem = 0;
   double sum_timers = 0;
   uint64_t timers[TIMERS_INIT_COUNT] = {0};
   unsigned long long commIdHash;
 
   timers[TIMER_INIT_TOTAL] = clockNano();
   CUDACHECKGOTO(cudaSetDevice(cudaDev), res, fail);
-  CUDACHECKGOTO(cudaDeviceGetAttribute(&maxSharedMem, cudaDevAttrMaxSharedMemoryPerBlockOptin, cudaDev), res, fail);
-  CUDACHECKGOTO(cudaDeviceGetAttribute(&archMajor, cudaDevAttrComputeCapabilityMajor, cudaDev), res, fail);
-  CUDACHECKGOTO(cudaDeviceGetAttribute(&archMinor, cudaDevAttrComputeCapabilityMinor, cudaDev), res, fail);
-  cudaArch = 100 * archMajor + 10 * archMinor;
-
-  timers[TIMER_INIT_KERNELS] = clockNano();
-  NCCLCHECKGOTO(ncclInitKernelsForDevice(cudaArch, maxSharedMem, &maxLocalSizeBytes), res, fail);
-  // Set the maximum kernel stack size of all kernels to avoid
-  // a CUDA memory reconfig on load (c.f. NVSHMEM issue)
-  if (maxLocalSizeBytes > 0 && ncclParamSetStackSize() == 1) {
-    TRACE(NCCL_INIT, "Setting cudaLimitStackSize to %zu", maxLocalSizeBytes);
-    CUDACHECKIGNORE(cudaDeviceSetLimit(cudaLimitStackSize, maxLocalSizeBytes));
-  }
-  timers[TIMER_INIT_KERNELS] = clockNano() - timers[TIMER_INIT_KERNELS];
 
   if (job->parent && !job->isGrow) {
     // SPLIT/SHRINK: use bootstrapSplit
@@ -2269,8 +2240,8 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
     eatHash(hacc, &job->color);
     comm->commHash = digestHash(hacc);
     timers[TIMER_INIT_ALLOC] = clockNano();
-    NCCLCHECKGOTO(commAlloc(comm, job->parent, job->nranks, job->myrank), res, fail);
-    timers[TIMER_INIT_ALLOC] = clockNano() - timers[TIMER_INIT_ALLOC];
+    NCCLCHECKGOTO(commAlloc(comm, job->parent, job->nranks, job->myrank, &timers[TIMER_INIT_KERNELS]), res, fail);
+    timers[TIMER_INIT_ALLOC] = clockNano() - timers[TIMER_INIT_ALLOC] - timers[TIMER_INIT_KERNELS];
     comm->isGrow = false;
     INFO(NCCL_INIT,
          "%s comm %p rank %d nranks %d cudaDev %d nvmlDev %d busId %lx commId 0x%" PRIx64 " parent %p childCount %d "
@@ -2295,8 +2266,8 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
       comm->commHash = commIdHash = getHash(job->commId->internal, NCCL_UNIQUE_ID_BYTES);
     }
     timers[TIMER_INIT_ALLOC] = clockNano();
-    NCCLCHECKGOTO(commAlloc(comm, NULL, job->nranks, job->myrank), res, fail);
-    timers[TIMER_INIT_ALLOC] = clockNano() - timers[TIMER_INIT_ALLOC];
+    NCCLCHECKGOTO(commAlloc(comm, NULL, job->nranks, job->myrank, &timers[TIMER_INIT_KERNELS]), res, fail);
+    timers[TIMER_INIT_ALLOC] = clockNano() - timers[TIMER_INIT_ALLOC] - timers[TIMER_INIT_KERNELS];
 
     comm->isGrow = job->isGrow;
     INFO(NCCL_INIT, "[Rank %d] %s comm %p rank %d nranks %d cudaDev %d nvmlDev %d busId %lx commId 0x%llx - Init START",
@@ -2306,8 +2277,6 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
     NCCLCHECKGOTO(bootstrapInit(job->nId, (struct ncclBootstrapHandle*)job->commId, comm, job->parent), res, fail);
     timers[TIMER_INIT_BOOTSTRAP] = clockNano() - timers[TIMER_INIT_BOOTSTRAP];
   }
-  comm->cudaArch = cudaArch;
-  comm->maxSharedMemOptin = maxSharedMem;
 
   NCCLCHECKGOTO(initTransportsRank(comm, job->parent, timers), res, fail);
 

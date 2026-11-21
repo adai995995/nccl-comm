@@ -1,5 +1,6 @@
 # Misc sources
 set(MISC_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/device_env.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/strongstream.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/crypt.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/socket.cc

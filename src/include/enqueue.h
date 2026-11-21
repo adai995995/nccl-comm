@@ -38,7 +38,7 @@ ncclResult_t ncclTaskPreTuning(struct ncclComm* comm, struct ncclRawTaskQueue* r
                                struct ncclTaskTuningInfoQueue* tiq);
 ncclResult_t ncclTaskPrepare(struct ncclComm* comm, ncclSimInfo_t* simInfo);
 
-ncclResult_t ncclInitKernelsForDevice(int cudaArch, int maxSharedMem, size_t* maxStackSize);
+ncclResult_t ncclInitKernelsForDevice(const struct ncclDeviceFacts* facts, struct ncclKernelInfo* info);
 ncclResult_t ncclEnqueueCheck(struct ncclInfo* info);
 ncclResult_t ncclPlannerSetCapturingGraph(struct ncclComm* comm, struct ncclInfo* info);
 ncclResult_t ncclLaunchPrepare(struct ncclComm* comm);

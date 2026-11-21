@@ -53,15 +53,19 @@ static int64_t symCeAllGatherThreshold(struct ncclComm* comm) {
   return threshold;
 }
 
-// Returns maximum kernel stack size of all CUDA kernels
-ncclResult_t ncclInitKernelsForDevice(int cudaArch, int maxSharedMem, size_t* maxStackSize) {
+// Configure the current context and save device-dependent results in ContextEnv.
+ncclResult_t ncclInitKernelsForDevice(const ncclDeviceFacts* facts, ncclKernelInfo* info) {
   ncclResult_t result = ncclSuccess;
 
-  if (maxStackSize) *maxStackSize = 0;
+  int cudaArch = facts->cudaArch;
+  int maxSharedMem = facts->maxSharedMemOptin;
+  size_t* maxStackSize = &info->maxStackBytes;
+  NCCLCHECK(ncclCalloc(&info->symMaxDynamicSmem, std::max(1, ncclSymkKernelCount)));
+  NCCLCHECK(ncclCalloc(&info->symMaxThreads, std::max(1, ncclSymkKernelCount)));
+  NCCLCHECK(ncclCalloc(&info->genMaxDynamicSmem, std::max(1, ncclGenkKernelCount)));
   int carveout = ncclParamL1SharedMemoryCarveout();
   int maxDynamicSmem = 1 << 30;
-  int driverVersion;
-  NCCLCHECK(ncclCudaDriverVersion(&driverVersion));
+  int driverVersion = facts->driverVersion;
 
   enum {
     kernelSetDev,
@@ -76,24 +80,31 @@ ncclResult_t ncclInitKernelsForDevice(int cudaArch, int maxSharedMem, size_t* ma
   void** const kptrsProfileList[kernelSetCount] = {nullptr, ncclSymkKernelListProfile, ncclGenkKernelListProfile};
   int* const krequiresList[kernelSetCount] = {ncclDevKernelRequirements, ncclSymkKernelRequirements,
                                               ncclGenkKernelRequirements};
-  int* const kmaxDynamicSmemList[kernelSetCount] = {nullptr, ncclSymkKernelMaxDynamicSmem,
-                                                    ncclGenkKernelMaxDynamicSmem};
+  int* const kmaxDynamicSmemList[kernelSetCount] = {nullptr, info->symMaxDynamicSmem, info->genMaxDynamicSmem};
   const char* const kernelSetNames[kernelSetCount] = {"", "symmetric ", "general "};
+
+  // Driver compatibility is process-wide. Publish the function tables once;
+  // concurrent context initialization must not rewrite tables in active use.
+  static std::once_flag kernelDriverOnce;
+  std::call_once(kernelDriverOnce, [&] {
+    for (int set = 0; set < kernelSetCount; set++) {
+      for (int k = 0; k < kcounts[set]; k++) {
+        if (kptrsList[set][k] != nullptr && driverVersion < krequiresList[set][k]) {
+          INFO(NCCL_INIT, "Skipping %skernel %d which requires driver %d", kernelSetNames[set], k,
+               krequiresList[set][k]);
+          kptrsList[set][k] = nullptr;
+          if (kptrsProfileList[set] != nullptr) kptrsProfileList[set][k] = nullptr;
+        }
+      }
+    }
+  });
 
   for (int set = 0; set < kernelSetCount; set++) {
     int kcount = kcounts[set];
     void** kptrs = kptrsList[set];
     void** kptrsProfile = kptrsProfileList[set];
-    int* krequires = krequiresList[set];
     int* kmaxDynamicSmem = kmaxDynamicSmemList[set];
-    const char* kernelSetName = kernelSetNames[set];
     for (int k = 0; k < kcount; k++) {
-      if (kptrs[k] != nullptr && driverVersion < krequires[k]) {
-        INFO(NCCL_INIT, "Skipping %skernel %d which requires driver %d", kernelSetName, k, krequires[k]);
-        kptrs[k] = nullptr;
-        if (kptrsProfile != nullptr) kptrsProfile[k] = nullptr;
-      }
-
       // Configure the default and, for Symk/Genk, the instrumented variant. Smem
       // is recorded once from the default (v==0) and shared (identical footprints).
       void* variants[2] = {kptrs[k], kptrsProfile != nullptr ? kptrsProfile[k] : nullptr};
@@ -108,7 +119,7 @@ ncclResult_t ncclInitKernelsForDevice(int cudaArch, int maxSharedMem, size_t* ma
         if (set == kernelSetSymk && v == 0) {
           // AlltoAll LL derives its warp and CTA layout from this exact
           // kernel's device-specific thread limit.
-          ncclSymkKernelMaxThreads[k] = attr.maxThreadsPerBlock;
+          info->symMaxThreads[k] = attr.maxThreadsPerBlock;
         }
 
         if (maxStackSize) {

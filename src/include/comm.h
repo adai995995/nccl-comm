@@ -589,6 +589,7 @@ struct ncclComm {
   struct ncclDestructor* destructorHead;
 
   struct ncclCudaContext* context;
+  const struct ncclDeviceFacts* deviceFacts;
   struct ncclSharedResources* sharedRes;
   /* map to top parent ranks. */
   int* topParentRanks;
