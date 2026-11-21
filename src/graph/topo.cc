@@ -9,6 +9,7 @@
 #include "cudawrap.h"
 #include "graph.h"
 #include "topo.h"
+#include "topo_cache.h"
 #include <cstring>
 #include "comm.h"
 #include "nccl.h"
@@ -1991,56 +1992,59 @@ exit:
   return ret;
 }
 
-ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** system, const char* dumpXmlFile) {
-  ncclResult_t ret = ncclSuccess;
-  struct ncclXml* xml;
-  char* mem = NULL;
-  int* localRanks = NULL;
-  struct ncclXml* rankXml;
-  int localRank = -1, nLocalRanks = 0;
-  int fusedMaxNodes = 0;
-  int cpuArch = NCCL_TOPO_UNDEF;
-  struct ncclTopoNetInfo netInfo = {0};
-  struct ncclTopoNetRailKeyList railKeyList;
-  NCCLCHECK(xmlAlloc(&xml, NCCL_TOPO_XML_MAX_NODES));
-  const char* xmlTopoFile = ncclGetEnv("NCCL_TOPO_FILE");
+static ncclResult_t ncclTopoProbeLocalUncached(int64_t gpuBusId, const char* xmlTopoFile, ncclXml* xml) {
   if (xmlTopoFile) {
     INFO(NCCL_ENV, "NCCL_TOPO_FILE set by environment to %s", xmlTopoFile);
-    NCCLCHECKGOTO(ncclTopoGetXmlFromFile(xmlTopoFile, xml, 1), ret, fail);
+    NCCLCHECK(ncclTopoGetXmlFromFile(xmlTopoFile, xml, 1));
   } else {
     // Try default XML topology location
-    NCCLCHECKGOTO(ncclTopoGetXmlFromFile("/var/run/nvidia-topologyd/virtualTopology.xml", xml, 0), ret, fail);
+    NCCLCHECK(ncclTopoGetXmlFromFile("/var/run/nvidia-topologyd/virtualTopology.xml", xml, 0));
   }
   // Fixup the cpu's host_hashes.
   struct ncclXmlNode* node;
   // Update every cpu node's host_hash attribute since those are not
   // intended to be preserved from the XML files that have been read.
-  NCCLCHECKGOTO(xmlFindTag(xml, "cpu", &node), ret, fail);
+  NCCLCHECK(xmlFindTag(xml, "cpu", &node));
   while (node != nullptr) {
-    NCCLCHECKGOTO(xmlSetAttrLong(node, "host_hash", getHostHash()), ret, fail);
-    NCCLCHECKGOTO(xmlFindNextTag(xml, "cpu", node, &node), ret, fail);
+    NCCLCHECK(xmlSetAttrLong(node, "host_hash", getHostHash()));
+    NCCLCHECK(xmlFindNextTag(xml, "cpu", node, &node));
   }
   if (xml->maxIndex == 0) {
     // Create top tag
     struct ncclXmlNode* top;
-    NCCLCHECKGOTO(xmlAddNode(xml, NULL, "system", &top), ret, fail);
-    NCCLCHECKGOTO(xmlSetAttrInt(top, "version", NCCL_TOPO_XML_VERSION), ret, fail);
+    NCCLCHECK(xmlAddNode(xml, NULL, "system", &top));
+    NCCLCHECK(xmlSetAttrInt(top, "version", NCCL_TOPO_XML_VERSION));
   }
 
-  NCCLCHECKGOTO(ncclTopoRefreshBcmP2pLinks(), ret, fail);
+  NCCLCHECK(ncclTopoRefreshBcmP2pLinks());
 
   // Detect only the GPU managed by this process.  We'll get any others through XML fusion.
   char busId[NVML_DEVICE_PCI_BUS_ID_BUFFER_SIZE];
-  NCCLCHECKGOTO(int64ToBusId(comm->peerInfo[comm->rank].busId, busId), ret, fail);
-  NCCLCHECKGOTO(ncclTopoFillGpu(xml, busId, &node), ret, fail);
-  if (node) {
-    NCCLCHECKGOTO(xmlSetAttrInt(node, "keep", 1), ret, fail);
-    NCCLCHECKGOTO(xmlSetAttrInt(node, "rank", comm->rank), ret, fail);
-    NCCLCHECKGOTO(xmlInitAttrInt(node, "gdr", comm->peerInfo[comm->rank].gdrSupport), ret, fail);
-    NCCLCHECKGOTO(xmlSetAttrInt(node, "mlopart", comm->peerInfo[comm->rank].mloPart), ret, fail);
-  }
-  NCCLCHECKGOTO(ncclTopoGetXmlCpuArch(xml, &cpuArch), ret, fail);
+  NCCLCHECK(int64ToBusId(gpuBusId, busId));
+  NCCLCHECK(ncclTopoFillGpu(xml, busId, &node));
+  return ncclSuccess;
+}
 
+static ncclResult_t ncclTopoApplyLocalComm(struct ncclComm* comm, ncclXml* xml) {
+  char busId[NVML_DEVICE_PCI_BUS_ID_BUFFER_SIZE];
+  ncclXmlNode *pci = nullptr, *node = nullptr;
+  NCCLCHECK(int64ToBusId(comm->peerInfo[comm->rank].busId, busId));
+  NCCLCHECK(xmlFindTagKv(xml, "pci", &pci, "busid", busId));
+  if (pci) NCCLCHECK(xmlGetSub(pci, "gpu", &node));
+  if (node) {
+    NCCLCHECK(xmlSetAttrInt(node, "keep", 1));
+    NCCLCHECK(xmlSetAttrInt(node, "rank", comm->rank));
+    NCCLCHECK(xmlInitAttrInt(node, "gdr", comm->peerInfo[comm->rank].gdrSupport));
+    NCCLCHECK(xmlSetAttrInt(node, "mlopart", comm->peerInfo[comm->rank].mloPart));
+  }
+  return ncclSuccess;
+}
+
+static ncclResult_t ncclTopoApplyNetwork(struct ncclComm* comm, ncclXml* xml, const char* dumpXmlFile) {
+  int cpuArch = NCCL_TOPO_UNDEF;
+  struct ncclTopoNetInfo netInfo = {0};
+  struct ncclTopoNetRailKeyList railKeyList;
+  NCCLCHECK(ncclTopoGetXmlCpuArch(xml, &cpuArch));
   // Auto-detect NICs if needed, net/gin/collnet share the same xml/graph nodes.
   // Start with gin, then with collnet so that they precedence.
   {
@@ -2061,7 +2065,7 @@ ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** sy
       netInfo.makeVDevice = NULL;
       netInfo.devices = gin->devices;
       netInfo.railKeyList = &railKeyList;
-      NCCLCHECKGOTO(ncclTopoProcessNet(xml, dumpXmlFile, &netInfo), ret, fail);
+      NCCLCHECK(ncclTopoProcessNet(xml, dumpXmlFile, &netInfo));
     }
     ncclRma_t* rma = comm->rmaState.rmaProxyState.ncclRma;
     if (rma) {
@@ -2077,7 +2081,7 @@ ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** sy
       netInfo.makeVDevice = NULL;
       netInfo.devices = rma->devices;
       netInfo.railKeyList = &railKeyList;
-      NCCLCHECKGOTO(ncclTopoProcessNet(xml, dumpXmlFile, &netInfo), ret, fail);
+      NCCLCHECK(ncclTopoProcessNet(xml, dumpXmlFile, &netInfo));
     }
     if (collNetSupport(comm)) {
       netInfo.net = 0;
@@ -2096,7 +2100,7 @@ ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** sy
       netInfo.railKeyList = &railKeyList;
       NCCLCHECK(ncclTopoGetFusionEnv(&netInfo.mergeLevel, &netInfo.forceMerge, comm->minCompCap, cpuArch));
       NCCLCHECK(ncclTopoGetMergePolicy(&netInfo.mergePolicy, comm->minCompCap, cpuArch));
-      NCCLCHECKGOTO(ncclTopoProcessNet(xml, dumpXmlFile, &netInfo), ret, fail);
+      NCCLCHECK(ncclTopoProcessNet(xml, dumpXmlFile, &netInfo));
     }
 
     netInfo.net = 1;
@@ -2115,77 +2119,36 @@ ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** sy
     netInfo.railKeyList = &railKeyList;
     NCCLCHECK(ncclTopoGetFusionEnv(&netInfo.mergeLevel, &netInfo.forceMerge, comm->minCompCap, cpuArch));
     NCCLCHECK(ncclTopoGetMergePolicy(&netInfo.mergePolicy, comm->minCompCap, cpuArch));
-    NCCLCHECKGOTO(ncclTopoProcessNet(xml, dumpXmlFile, &netInfo), ret, fail);
+    NCCLCHECK(ncclTopoProcessNet(xml, dumpXmlFile, &netInfo));
   }
 
-  // Remove XML branches which don't have a node with keep="1" (typically when importing a topology)
-  NCCLCHECKGOTO(ncclTopoTrimXml(xml), ret, fail);
+  return ncclSuccess;
+}
 
-  // XML topo fusion.
-  if (comm->MNNVL) {
-    // MNNVL clique support
-    nLocalRanks = comm->clique.size;
-    localRank = comm->cliqueRank;
-    localRanks = comm->clique.ranks;
-  } else {
-    // Intra-node fusion.  Much of the comm is not initialized yet at this point so we need to do our own calculations.
-    NCCLCHECKGOTO(ncclCalloc(&localRanks, comm->nRanks), ret, fail);
-    for (int i = 0; i < comm->nRanks; i++) {
-      if (comm->peerInfo[i].hostHash == comm->peerInfo[comm->rank].hostHash) {
-        if (i == comm->rank) localRank = nLocalRanks;
-        localRanks[nLocalRanks++] = i;
-      }
-    }
-  }
-  NCCLCHECKGOTO(ncclCalloc(&mem, nLocalRanks * xmlMemSize(NCCL_TOPO_XML_MAX_NODES)), ret, fail);
-  rankXml = (struct ncclXml*)(mem + xmlMemSize(NCCL_TOPO_XML_MAX_NODES) * localRank);
-  memcpy(rankXml, xml, xmlMemSize(NCCL_TOPO_XML_MAX_NODES));
-  NCCLCHECKGOTO(ncclTopoConvertXml(rankXml, (uintptr_t)xml->nodes, 1), ret, fail);
-  // nLocalRanks can't actually be 0, or we wouldn't be running at all...
-  // coverity[divide_by_zero]
-  NCCLCHECKGOTO(bootstrapIntraNodeAllGather(comm->bootstrap, localRanks, localRank, nLocalRanks, mem,
-                                            xmlMemSize(NCCL_TOPO_XML_MAX_NODES)),
-                ret, fail);
-  // ncclTopoFuseXml only copies existing source nodes into dst (never adds new
-  // ones), so fusedMaxNodes is a true upper bound on the fused node count.
-  for (int i = 0; i < nLocalRanks; i++) {
-    struct ncclXml* peerXml = (struct ncclXml*)(mem + xmlMemSize(NCCL_TOPO_XML_MAX_NODES) * i);
-    fusedMaxNodes += peerXml->maxIndex;
-  }
-  if (fusedMaxNodes > xml->maxNodes) {
-    free(xml);
-    xml = NULL;
-    NCCLCHECKGOTO(xmlAlloc(&xml, fusedMaxNodes), ret, fail);
-  } else {
-    // The original topology is preserved in mem, so reuse this allocation as the empty fusion destination.
-    xml->maxIndex = 0;
-  }
-  for (int i = 0; i < nLocalRanks; i++) {
-    struct ncclXml* peerXml = (struct ncclXml*)(mem + xmlMemSize(NCCL_TOPO_XML_MAX_NODES) * i);
-    NCCLCHECKGOTO(ncclTopoConvertXml(peerXml, (uintptr_t)peerXml->nodes, 0), ret, fail);
-    NCCLCHECKGOTO(ncclTopoFuseXml(xml, peerXml), ret, fail);
-  }
+static ncclResult_t ncclTopoBuildCommSystem(struct ncclComm* comm, ncclXml* xml,
+                                            struct ncclTopoSystem** system) {
+  NCCLCHECK(ncclTopoGetSystemFromXml(xml, system, getHostHash()));
+  (*system)->minDriverVersion = comm->minDriverVersion;
+  (*system)->cuMemGdrSupport = comm->cuMemGdrSupport;
+  return ncclSuccess;
+}
 
+ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** system, const char* dumpXmlFile) {
+  ncclResult_t ret = ncclSuccess;
+  ncclXml* xml = nullptr;
+  NCCLCHECKGOTO(ncclTopoProbeLocal(&comm->peerInfo[comm->rank], ncclTopoProbeLocalUncached, &xml), ret, exit);
+  NCCLCHECKGOTO(ncclTopoApplyLocalComm(comm, xml), ret, exit);
+  NCCLCHECKGOTO(ncclTopoApplyNetwork(comm, xml, dumpXmlFile), ret, exit);
+  NCCLCHECKGOTO(ncclTopoTrimXml(xml), ret, exit);
+  NCCLCHECKGOTO(ncclTopoGetNodeSnapshot(comm, &xml), ret, exit);
   if (dumpXmlFile && comm->rank == ncclParamTopoDumpFileRank()) {
     INFO(NCCL_ENV, "NCCL_TOPO_DUMP_FILE set by environment to %s", dumpXmlFile);
-    NCCLCHECKGOTO(ncclTopoDumpXmlToFile(dumpXmlFile, xml), ret, fail);
+    NCCLCHECKGOTO(ncclTopoDumpXmlToFile(dumpXmlFile, xml), ret, exit);
   }
-
-  // Only update our topo tracking structure if we aren't dumping (separate steps)
-  if (dumpXmlFile == NULL) {
-    NCCLCHECKGOTO(ncclTopoGetSystemFromXml(xml, system, getHostHash()), ret, fail);
-    // store comm related information
-    (*system)->minDriverVersion = comm->minDriverVersion;
-    (*system)->cuMemGdrSupport = comm->cuMemGdrSupport;
-  }
-
+  if (dumpXmlFile == nullptr) NCCLCHECKGOTO(ncclTopoBuildCommSystem(comm, xml, system), ret, exit);
 exit:
-  if (!comm->MNNVL) free(localRanks);
-  free(mem);
   free(xml);
   return ret;
-fail:
-  goto exit;
 }
 
 ncclResult_t ncclTopoGetLocal(struct ncclTopoSystem* system, int type, int index, int resultType,
