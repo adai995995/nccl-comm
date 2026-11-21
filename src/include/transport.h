@@ -75,6 +75,7 @@ struct ncclPeerInfo {
   bool cuMemHostSupport;
   uint32_t cftUnicastCliqueId;
   uint32_t cftMulticastCliqueId;
+  int topoCacheMode; // Negotiate node snapshot reuse in the existing peer-info exchange.
 };
 
 #define CONNECT_SIZE 256

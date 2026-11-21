@@ -14,8 +14,9 @@
 #include <mutex>
 #include <sys/stat.h>
 #include <unordered_map>
+#include <vector>
 
-NCCL_PARAM(TopoCache, "TOPO_CACHE", 1);
+NCCL_PARAM(TopoCache, "TOPO_CACHE", 2);
 NCCL_PARAM(TopoCacheMaxBytes, "TOPO_CACHE_MAX_BYTES", 64 * 1024 * 1024);
 
 namespace {
@@ -72,15 +73,15 @@ ncclResult_t unpackNode(Reader* in, ncclXml* xml, ncclXmlNode* parent) {
   ncclXmlNode* node;
   NCCLCHECK(xmlAddNode(xml, parent, name, &node));
   node->type = type;
+  node->nAttrs = nAttrs;
   for (int a = 0; a < nAttrs; a++) {
-    char key[MAX_STR_LEN + 1], value[MAX_STR_LEN + 1];
-    if (!in->string(key) || !in->string(value)) return ncclInternalError;
-    NCCLCHECK(xmlSetAttr(node, key, value));
+    if (!in->string(node->attrs[a].key) || !in->string(node->attrs[a].value)) return ncclInternalError;
   }
   if (!in->get(&nSubs) || nSubs < 0 || nSubs > MAX_SUBS) return ncclInternalError;
   for (int s = 0; s < nSubs; s++) NCCLCHECK(unpackNode(in, xml, node));
   return ncclSuccess;
 }
+
 
 struct Entry {
   std::string key;
@@ -235,37 +236,119 @@ ncclResult_t ncclTopoProbeLocal(const ncclPeerInfo* peer, ncclTopoLocalProbe pro
   return ncclSuccess;
 }
 
-ncclResult_t ncclTopoGetNodeSnapshot(struct ncclComm* comm, ncclXml** xmlOut) {
+namespace {
+struct ContributionInfo {
+  uint64_t digest[2];
+  int eligible;
+};
+
+void activeGpus(ncclXmlNode* node, std::vector<ncclXmlNode*>* gpus) {
+  if (strcmp(node->name, "gpu") == 0) gpus->push_back(node);
+  for (int s = 0; s < node->nSubs; s++) activeGpus(node->subs[s], gpus);
+}
+
+// Strip only this contribution's comm rank. Keep effective GDR, network view,
+// XML overrides and child order in the signature. Unusual multi-GPU injected
+// contributions take the original exchange/fusion path.
+ncclResult_t packContribution(ncclXml* xml, int rank, std::string* packed, bool* eligible) {
+  *eligible = false;
+  std::vector<ncclXmlNode*> gpus;
+  activeGpus(xml->nodes, &gpus);
+  ncclXmlNode* owner = nullptr;
+  for (auto* gpu : gpus) {
+    int r;
+    NCCLCHECK(xmlGetAttrIntDefault(gpu, "rank", &r, -1));
+    if (r < 0) continue;
+    if (r != rank || owner != nullptr) return ncclSuccess;
+    owner = gpu;
+  }
+  if (owner == nullptr) return ncclSuccess;
+  NCCLCHECK(xmlSetAttrInt(owner, "rank", 0));
+  ncclResult_t ret = ncclTopoPackXml(xml, packed);
+  NCCLCHECK(xmlSetAttrInt(owner, "rank", rank));
+  *eligible = ret == ncclSuccess;
+  return ret;
+}
+
+ContributionInfo contributionInfo(const ncclPeerInfo& peer, const std::string& packed, bool eligible) {
+  ContributionInfo info{};
+  info.eligible = eligible;
+  uint64_t a[2] = {1, 1}, b[2] = {snapshotVersion, 0x6e63636c746f706f};
+  eatHash(a, &peer.gpuUuid);
+  eatHash(a, packed.data(), packed.size());
+  eatHash(b, &peer.gpuUuid);
+  eatHash(b, packed.data(), packed.size());
+  info.digest[0] = digestHash(a);
+  info.digest[1] = digestHash(b);
+  return info;
+}
+
+std::string fragmentKey(const ContributionInfo& info) {
+  std::string key = "fragment";
+  key.append(reinterpret_cast<const char*>(info.digest), sizeof(info.digest));
+  return key;
+}
+
+std::string systemKey(const std::vector<ContributionInfo>& info) {
+  std::string key = "system";
+  append(&key, snapshotVersion);
+  // Ordered physical contributions, not communicator IDs or old comm ranks.
+  for (auto& member : info) key.append(reinterpret_cast<const char*>(member.digest), sizeof(member.digest));
+  return key;
+}
+
+ncclResult_t mapRanks(ncclXml* xml, const std::vector<int>& rankMap) {
+  for (int i = 0; i < xml->maxIndex; i++) {
+    ncclXmlNode* node = xml->nodes + i;
+    if (strcmp(node->name, "gpu") != 0) continue;
+    int rank;
+    NCCLCHECK(xmlGetAttrIntDefault(node, "rank", &rank, -1));
+    if (rank < 0) continue;
+    if (rank >= int(rankMap.size()) || rankMap[rank] < 0) return ncclInternalError;
+    NCCLCHECK(xmlSetAttrInt(node, "rank", rankMap[rank]));
+  }
+  return ncclSuccess;
+}
+
+using OwnedXml = std::unique_ptr<ncclXml, decltype(&free)>;
+
+ncclResult_t fuseContributions(const std::vector<ncclTopoSnapshot>& fragments, ncclXml** xmlOut) {
+  std::vector<OwnedXml> parts;
+  int maxNodes = 0;
+  for (auto& fragment : fragments) {
+    ncclXml* xml;
+    NCCLCHECK(ncclTopoUnpackXml(*fragment, 0, &xml));
+    parts.emplace_back(xml, free);
+    maxNodes += xml->maxIndex;
+  }
+  ncclXml* xml;
+  NCCLCHECK(xmlAlloc(&xml, maxNodes));
+  OwnedXml fused(xml, free);
+  for (int i = 0; i < int(parts.size()); i++) {
+    NCCLCHECK(mapRanks(parts[i].get(), std::vector<int>{i}));
+    NCCLCHECK(ncclTopoFuseXml(fused.get(), parts[i].get()));
+  }
+  *xmlOut = fused.release();
+  return ncclSuccess;
+}
+} // namespace
+
+static ncclResult_t exchangeNodeXml(struct ncclComm* comm, std::vector<int>& localRanks, int localRank,
+                                    ncclXml** xmlOut, std::vector<ncclTopoSnapshot>* contributions) {
   ncclResult_t ret = ncclSuccess;
   ncclXml* xml = *xmlOut;
   char* mem = nullptr;
-  int* localRanks = nullptr;
   ncclXml* rankXml;
-  int localRank = -1, nLocalRanks = 0;
+  int nLocalRanks = localRanks.size();
   int fusedMaxNodes = 0;
-  // XML topo fusion.
-  if (comm->MNNVL) {
-    // MNNVL clique support
-    nLocalRanks = comm->clique.size;
-    localRank = comm->cliqueRank;
-    localRanks = comm->clique.ranks;
-  } else {
-    // Intra-node fusion.  Much of the comm is not initialized yet at this point so we need to do our own calculations.
-    NCCLCHECKGOTO(ncclCalloc(&localRanks, comm->nRanks), ret, fail);
-    for (int i = 0; i < comm->nRanks; i++) {
-      if (comm->peerInfo[i].hostHash == comm->peerInfo[comm->rank].hostHash) {
-        if (i == comm->rank) localRank = nLocalRanks;
-        localRanks[nLocalRanks++] = i;
-      }
-    }
-  }
   NCCLCHECKGOTO(ncclCalloc(&mem, nLocalRanks * xmlMemSize(NCCL_TOPO_XML_MAX_NODES)), ret, fail);
   rankXml = (struct ncclXml*)(mem + xmlMemSize(NCCL_TOPO_XML_MAX_NODES) * localRank);
   memcpy(rankXml, xml, xmlMemSize(NCCL_TOPO_XML_MAX_NODES));
   NCCLCHECKGOTO(ncclTopoConvertXml(rankXml, (uintptr_t)xml->nodes, 1), ret, fail);
+  INFO(NCCL_GRAPH, "TOPO/CACHE node XML exchange ranks %d", nLocalRanks);
   // nLocalRanks can't actually be 0, or we wouldn't be running at all...
   // coverity[divide_by_zero]
-  NCCLCHECKGOTO(bootstrapIntraNodeAllGather(comm->bootstrap, localRanks, localRank, nLocalRanks, mem,
+  NCCLCHECKGOTO(bootstrapIntraNodeAllGather(comm->bootstrap, localRanks.data(), localRank, nLocalRanks, mem,
                                             xmlMemSize(NCCL_TOPO_XML_MAX_NODES)),
                 ret, fail);
   // ncclTopoFuseXml only copies existing source nodes into dst (never adds new
@@ -285,14 +368,112 @@ ncclResult_t ncclTopoGetNodeSnapshot(struct ncclComm* comm, ncclXml** xmlOut) {
   for (int i = 0; i < nLocalRanks; i++) {
     struct ncclXml* peerXml = (struct ncclXml*)(mem + xmlMemSize(NCCL_TOPO_XML_MAX_NODES) * i);
     NCCLCHECKGOTO(ncclTopoConvertXml(peerXml, (uintptr_t)peerXml->nodes, 0), ret, fail);
+    if (contributions) {
+      std::string packed;
+      bool eligible;
+      NCCLCHECKGOTO(packContribution(peerXml, localRanks[i], &packed, &eligible), ret, fail);
+      if (eligible) (*contributions)[i] = std::make_shared<const std::string>(std::move(packed));
+    }
     NCCLCHECKGOTO(ncclTopoFuseXml(xml, peerXml), ret, fail);
   }
 
 exit:
   *xmlOut = xml;
-  if (!comm->MNNVL) free(localRanks);
   free(mem);
   return ret;
 fail:
   goto exit;
+}
+
+ncclResult_t ncclTopoGetNodeSnapshot(struct ncclComm* comm, ncclXml** xmlOut) {
+  std::vector<int> localRanks;
+  int localRank = -1;
+  if (comm->MNNVL) {
+    localRanks.assign(comm->clique.ranks, comm->clique.ranks + comm->clique.size);
+    return exchangeNodeXml(comm, localRanks, comm->cliqueRank, xmlOut, nullptr);
+  }
+  int mode = 2;
+  for (int r = 0; r < comm->nRanks; r++) {
+    if (comm->peerInfo[r].hostHash == comm->peerInfo[comm->rank].hostHash) {
+      if (r == comm->rank) localRank = localRanks.size();
+      localRanks.push_back(r);
+      mode = std::min(mode, comm->peerInfo[r].topoCacheMode);
+    }
+  }
+  // Negotiated through the existing peer-info AllGather. Even a rank with
+  // caching disabled follows the same sequence of collectives as its peers.
+  if (mode < 2) return exchangeNodeXml(comm, localRanks, localRank, xmlOut, nullptr);
+
+  int nLocalRanks = localRanks.size();
+  std::string packed;
+  bool eligible;
+  NCCLCHECK(packContribution(*xmlOut, comm->rank, &packed, &eligible));
+  std::vector<ContributionInfo> info(nLocalRanks);
+  info[localRank] = contributionInfo(comm->peerInfo[comm->rank], packed, eligible);
+  // Revalidate every contributor's current XML/plugin view with a small record.
+  NCCLCHECK(bootstrapIntraNodeAllGather(comm->bootstrap, localRanks.data(), localRank, nLocalRanks,
+                                        info.data(), sizeof(ContributionInfo)));
+  for (auto& member : info) {
+    if (!member.eligible) return exchangeNodeXml(comm, localRanks, localRank, xmlOut, nullptr);
+  }
+
+  const std::string key = systemKey(info);
+  auto saved = ncclTopoCacheFind(key);
+  std::vector<ncclTopoSnapshot> fragments(nLocalRanks);
+  std::vector<int> hits(nLocalRanks, 0);
+  hits[localRank] = saved != nullptr;
+  if (!saved) {
+    hits[localRank] = 1;
+    for (int i = 0; i < nLocalRanks; i++) {
+      fragments[i] = i == localRank ? std::make_shared<const std::string>(packed) :
+                                      ncclTopoCacheFind(fragmentKey(info[i]));
+      if (!fragments[i]) hits[localRank] = 0;
+    }
+  }
+  // No registry/probe/plugin lock is held across bootstrap. Hold shared_ptrs
+  // through agreement so concurrent eviction cannot invalidate a promised hit.
+  NCCLCHECK(bootstrapIntraNodeAllGather(comm->bootstrap, localRanks.data(), localRank, nLocalRanks,
+                                        hits.data(), sizeof(int)));
+  bool allHit = std::all_of(hits.begin(), hits.end(), [](int hit) { return hit != 0; });
+  if (!allHit) {
+    // One miss sends every participant down the original XML exchange path.
+    INFO(NCCL_GRAPH, "TOPO/CACHE node miss ready %d/%d", int(std::count(hits.begin(), hits.end(), 1)), nLocalRanks);
+    NCCLCHECK(exchangeNodeXml(comm, localRanks, localRank, xmlOut, &fragments));
+    for (int i = 0; i < nLocalRanks; i++) {
+      if (!fragments[i]) return ncclSuccess;
+      auto actual = contributionInfo(comm->peerInfo[localRanks[i]], *fragments[i], true);
+      if (memcmp(actual.digest, info[i].digest, sizeof(actual.digest)) != 0) return ncclSuccess;
+    }
+    for (int i = 0; i < nLocalRanks; i++) ncclTopoCacheInsert(fragmentKey(info[i]), *fragments[i]);
+    // Store local slot numbers. The new comm's rank map is applied to a private
+    // copy on lookup, including non-contiguous DP ranks and reordered groups.
+    std::vector<int> toLocal(comm->nRanks, -1);
+    for (int i = 0; i < nLocalRanks; i++) toLocal[localRanks[i]] = i;
+    NCCLCHECK(mapRanks(*xmlOut, toLocal));
+    ncclResult_t ret = ncclTopoPackXml(*xmlOut, &packed);
+    NCCLCHECK(mapRanks(*xmlOut, localRanks));
+    NCCLCHECK(ret);
+    ncclTopoCacheInsert(key, packed);
+    return ncclSuccess;
+  }
+
+  ncclXml* xml = nullptr;
+  if (saved) {
+    NCCLCHECK(ncclTopoUnpackXml(*saved, 0, &xml));
+  } else {
+    // A warmed larger group supplies the selected members' immutable facts.
+    // Fuse only those contributions, in the new group's order. This preserves
+    // the legacy NIC union and GPU order instead of pruning a foreign graph.
+    NCCLCHECK(fuseContributions(fragments, &xml));
+  }
+  OwnedXml result(xml, free);
+  if (!saved) {
+    NCCLCHECK(ncclTopoPackXml(xml, &packed));
+    ncclTopoCacheInsert(key, packed);
+  }
+  NCCLCHECK(mapRanks(xml, localRanks));
+  free(*xmlOut);
+  *xmlOut = result.release();
+  INFO(NCCL_GRAPH, "TOPO/CACHE node reuse ranks %d (%s)", nLocalRanks, saved ? "snapshot" : "projection");
+  return ncclSuccess;
 }

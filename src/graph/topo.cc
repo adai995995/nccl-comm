@@ -2133,14 +2133,26 @@ static ncclResult_t ncclTopoBuildCommSystem(struct ncclComm* comm, ncclXml* xml,
   return ncclSuccess;
 }
 
-ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** system, const char* dumpXmlFile) {
+ncclResult_t ncclTopoGetCommXml(struct ncclComm* comm, const char* dumpXmlFile, ncclXml** xmlOut) {
   ncclResult_t ret = ncclSuccess;
   ncclXml* xml = nullptr;
+  *xmlOut = nullptr;
   NCCLCHECKGOTO(ncclTopoProbeLocal(&comm->peerInfo[comm->rank], ncclTopoProbeLocalUncached, &xml), ret, exit);
   NCCLCHECKGOTO(ncclTopoApplyLocalComm(comm, xml), ret, exit);
   NCCLCHECKGOTO(ncclTopoApplyNetwork(comm, xml, dumpXmlFile), ret, exit);
   NCCLCHECKGOTO(ncclTopoTrimXml(xml), ret, exit);
   NCCLCHECKGOTO(ncclTopoGetNodeSnapshot(comm, &xml), ret, exit);
+  *xmlOut = xml;
+  return ncclSuccess;
+exit:
+  free(xml);
+  return ret;
+}
+
+ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** system, const char* dumpXmlFile) {
+  ncclResult_t ret = ncclSuccess;
+  ncclXml* xml = nullptr;
+  NCCLCHECKGOTO(ncclTopoGetCommXml(comm, dumpXmlFile, &xml), ret, exit);
   if (dumpXmlFile && comm->rank == ncclParamTopoDumpFileRank()) {
     INFO(NCCL_ENV, "NCCL_TOPO_DUMP_FILE set by environment to %s", dumpXmlFile);
     NCCLCHECKGOTO(ncclTopoDumpXmlToFile(dumpXmlFile, xml), ret, exit);

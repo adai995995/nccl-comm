@@ -24,6 +24,7 @@
 #include "enqueue.h"
 #include "graph.h"
 #include "graph/topo.h"
+#include "graph/topo_cache.h"
 #include "argcheck.h"
 #include "ras.h"
 #include "progress_monitor.h"
@@ -883,6 +884,7 @@ static const char* mnnvlDegradedBwStr(unsigned int healthMask) {
 static ncclResult_t fillInfo(struct ncclComm* comm, struct ncclPeerInfo* info, uint64_t commHash) {
   const ncclDeviceFacts* facts = comm->deviceFacts;
   info->rank = comm->rank;
+  info->topoCacheMode = ncclTopoCacheMode();
   info->cudaDev = comm->cudaDev;
   info->nvmlDev = comm->nvmlDev;
   info->version = NCCL_VERSION_CODE;

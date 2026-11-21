@@ -33,5 +33,8 @@ void ncclTopoCacheInsert(const std::string& key, const std::string& packed);
 void ncclTopoCacheClear();
 
 ncclResult_t ncclTopoGetNodeSnapshot(struct ncclComm* comm, ncclXml** xml);
+// Caller owns the assembled, communicator-specific XML (also useful to compare
+// the cached and uncached paths before graph conversion/search).
+ncclResult_t ncclTopoGetCommXml(struct ncclComm* comm, const char* dumpXmlFile, ncclXml** xml);
 
 #endif
