@@ -53,6 +53,7 @@ static ncclResult_t nvlsFreeUc(struct ncclComm* comm, struct ncclNvlsUcSegment* 
 
 #include "bootstrap.h"
 #include "channel.h"
+#include "fabric/device_fabric.h"
 
 #define NVLS_MEM_ALIGN_SIZE (1 << 21)
 
@@ -439,6 +440,7 @@ ncclResult_t ncclNvlsBufferSetup(struct ncclComm* comm) {
                                           comm->localRankToRank[0]),
                 res, fail);
   comm->nvlsResources->inited = true;
+  ncclDeviceFabricRegisterNvlsClique(comm, comm->nvlsResources);
 
 exit:
   return res;
@@ -490,6 +492,11 @@ ncclResult_t ncclNvlsSetup(struct ncclComm* comm, struct ncclComm* parent) {
   char shmPath[sizeof("/dev/shm/nccl-XXXXXX")];
   uintptr_t* nvlsShmem = NULL;
   int* parentSlots = NULL;
+  struct ncclNvlsSharedRes* fabricNvls = nullptr;
+  struct ncclChannelPeer* fabricOwnerPeers[MAXCHANNELS] = {};
+  struct ncclDevChannelPeer* fabricOwnerDevPeers[MAXCHANNELS] = {};
+  std::vector<int> fabricSlotMap;
+  bool fabricShare = false;
   bool nvlsShare =
     parent && ncclNvlsTransportEnabled(parent) && parent->shareResources && parent->localRanks == comm->localRanks;
 
@@ -498,6 +505,11 @@ ncclResult_t ncclNvlsSetup(struct ncclComm* comm, struct ncclComm* parent) {
   if (nvlsShare) {
     NCCLCHECKGOTO(ncclCalloc(&parentSlots, comm->localRanks), res, fail);
     NCCLCHECKGOTO(nvlsMapSharedSlots(comm, parent, parentSlots, &nvlsShare), res, fail);
+  }
+
+  if (!nvlsShare) {
+    fabricShare = ncclDeviceFabricMatchNvlsClique(comm, &fabricNvls, fabricOwnerPeers, fabricOwnerDevPeers,
+                                                  &fabricSlotMap);
   }
 
   if (nvlsShare) {
@@ -513,6 +525,17 @@ ncclResult_t ncclNvlsSetup(struct ncclComm* comm, struct ncclComm* parent) {
 
     comm->nvlsResources = parent->nvlsResources;
     ncclAtomicRefCountIncrement(&parent->nvlsResources->refCount);
+  } else if (fabricShare) {
+    comm->nvlsChannels = std::min(comm->nvlsChannels, fabricNvls->nChannels);
+    comm->nvlsChunkSize = fabricNvls->chunkSize;
+    comm->nvlsTreeMaxChunkSize = fabricNvls->treeMaxChunkSize;
+    for (int c = 0; c < comm->nvlsChannels; c++) {
+      NCCLCHECKGOTO(initNvlsChannelFromFabric(comm, c, fabricOwnerPeers[c], fabricOwnerDevPeers[c],
+                                              fabricSlotMap.data()),
+                    res, fail);
+    }
+    comm->nvlsResources = fabricNvls;
+    ncclAtomicRefCountIncrement(&fabricNvls->refCount);
   } else {
     struct ncclNvlsSharedRes* resources = NULL;
     int nHeads = comm->channels[0].nvls.nHeads;
@@ -550,8 +573,20 @@ ncclResult_t ncclNvlsSetup(struct ncclComm* comm, struct ncclComm* parent) {
     comm->nvlsResources->treeMaxChunkSize = comm->nvlsTreeMaxChunkSize;
     resources = comm->nvlsResources;
 
+    NCCLCHECKGOTO(ncclStrongStreamAcquire(ncclCudaGraphNone(comm->config.graphUsageMode), &comm->sharedRes->hostStream,
+                                          /*concurrent=*/false, &hostStream),
+                  res, fail);
+    NCCLCHECKGOTO(ncclStrongStreamAcquire(ncclCudaGraphNone(comm->config.graphUsageMode),
+                                          &comm->sharedRes->deviceStream, /*concurrent=*/false, &deviceStream),
+                  res, fail);
+    if (comm->devMetaSlab != nullptr && nChannels > 0 && comm->localRanks > 0) {
+      size_t totalNvlsPeers = (size_t)nChannels * (size_t)comm->localRanks;
+      NCCLCHECKGOTO(ncclCalloc(&resources->nvlsPeersSlab, totalNvlsPeers), res, fail_streams);
+      NCCLCHECKGOTO(ncclCudaCallocAsync(&resources->nvlsDevPeersSlab, totalNvlsPeers, deviceStream, comm->memManager),
+                    res, fail_streams);
+    }
     for (int c = 0; c < nChannels; c++) {
-      NCCLCHECKGOTO(initNvlsChannel(comm, c, NULL, NULL), res, fail);
+      NCCLCHECKGOTO(initNvlsChannel(comm, c, NULL, NULL), res, fail_streams);
     }
 
     memset(&resources->accessDesc, 0, sizeof(resources->accessDesc));
@@ -559,13 +594,6 @@ ncclResult_t ncclNvlsSetup(struct ncclComm* comm, struct ncclComm* parent) {
     resources->accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     resources->accessDesc.location.id = comm->cudaDev;
     resources->dev = comm->cudaDev;
-
-    NCCLCHECKGOTO(ncclStrongStreamAcquire(ncclCudaGraphNone(comm->config.graphUsageMode), &comm->sharedRes->hostStream,
-                                          /*concurrent=*/false, &hostStream),
-                  res, fail);
-    NCCLCHECKGOTO(ncclStrongStreamAcquire(ncclCudaGraphNone(comm->config.graphUsageMode),
-                                          &comm->sharedRes->deviceStream, /*concurrent=*/false, &deviceStream),
-                  res, fail);
     // Build the single shared MC group for this NVLS domain. The data slice is
     // reserved here but bound later by ncclNvlsBufferSetup.
     {
@@ -643,14 +671,22 @@ ncclResult_t ncclNvlsSetup(struct ncclComm* comm, struct ncclComm* parent) {
                       res, fail);
       }
     }
-    NCCLCHECKGOTO(ncclStreamWaitStream(deviceStream, hostStream, comm->sharedRes->scratchEvent), res, fail);
+    NCCLCHECKGOTO(ncclStreamWaitStream(deviceStream, hostStream, comm->sharedRes->scratchEvent), res, fail_streams);
     NCCLCHECKGOTO(ncclStrongStreamRelease(ncclCudaGraphNone(comm->config.graphUsageMode), &comm->sharedRes->hostStream,
                                           /*concurrent=*/false),
                   res, fail);
     NCCLCHECKGOTO(ncclStrongStreamRelease(ncclCudaGraphNone(comm->config.graphUsageMode),
                                           &comm->sharedRes->deviceStream, /*concurrent=*/false),
                   res, fail);
+    goto setup_shm;
+  fail_streams:
+    (void)ncclStrongStreamRelease(ncclCudaGraphNone(comm->config.graphUsageMode), &comm->sharedRes->hostStream,
+                                  /*concurrent=*/false);
+    (void)ncclStrongStreamRelease(ncclCudaGraphNone(comm->config.graphUsageMode), &comm->sharedRes->deviceStream,
+                                  /*concurrent=*/false);
+    goto fail;
   }
+setup_shm:
 
   // MNNVL does not support NVLS buffer registration
   if (!comm->MNNVL && comm->nvlsResources->nvlsShmemHandle == NULL) {
@@ -701,6 +737,7 @@ ncclResult_t ncclNvlsFree(struct ncclComm* comm) {
   if (resources == NULL) return ncclSuccess;
 
   if (ncclAtomicRefCountDecrement(&resources->refCount) == 0) {
+    ncclDeviceFabricUnregisterNvlsClique(comm, resources);
     if (!comm->MNNVL && resources->nvlsShmemHandle) NCCLCHECKIGNORE(ncclShmClose(resources->nvlsShmemHandle), ret);
 
     if (resources->creditUc.ptr) {
@@ -715,6 +752,8 @@ ncclResult_t ncclNvlsFree(struct ncclComm* comm) {
     }
     if (resources->ubEnabled) ncclMcArenaDestroy(&resources->ubArena);
     NCCLCHECKIGNORE(ncclMcGroupDestroy(&resources->mcGroup), ret);
+    free(resources->nvlsPeersSlab);
+    if (resources->nvlsDevPeersSlab) ncclCudaFree(resources->nvlsDevPeersSlab, comm->memManager);
 
     free(resources);
     comm->nvlsResources = NULL;

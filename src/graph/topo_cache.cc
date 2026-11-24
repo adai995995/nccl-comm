@@ -6,6 +6,7 @@
  *************************************************************************/
 
 #include "topo_cache.h"
+#include "slot_route_memo.h"
 #include "topo.h"
 #include "transport.h"
 #include "param.h"
@@ -89,11 +90,16 @@ struct Entry {
   size_t bytes;
 };
 
+bool isNodeEntryKey(const std::string& key) {
+  return key.compare(0, 8, "fragment") == 0 || key.compare(0, 6, "system") == 0;
+}
+
 struct Cache {
   std::mutex mutex;
   std::list<Entry> entries; // Most recently used first.
   std::unordered_map<std::string, std::list<Entry>::iterator> index;
   size_t bytes = 0;
+  size_t nodeEntries = 0;
 };
 
 Cache& cache() {
@@ -183,20 +189,32 @@ void ncclTopoCacheInsert(const std::string& key, const std::string& packed) {
   while (c.bytes + bytes > size_t(limit)) {
     const Entry& last = c.entries.back();
     c.bytes -= last.bytes;
+    if (isNodeEntryKey(last.key)) c.nodeEntries--;
     c.index.erase(last.key);
     c.entries.pop_back();
   }
   c.entries.push_front({key, std::make_shared<const std::string>(packed), bytes});
   c.index.emplace(key, c.entries.begin());
   c.bytes += bytes;
+  if (isNodeEntryKey(key)) c.nodeEntries++;
 }
 
 void ncclTopoCacheClear() {
+  {
+    Cache& c = cache();
+    std::lock_guard<std::mutex> lock(c.mutex);
+    c.index.clear();
+    c.entries.clear();
+    c.bytes = 0;
+    c.nodeEntries = 0;
+  }
+  ncclSlotRouteMemoClear();
+}
+
+bool ncclTopoNodeCacheWarm() {
   Cache& c = cache();
   std::lock_guard<std::mutex> lock(c.mutex);
-  c.index.clear();
-  c.entries.clear();
-  c.bytes = 0;
+  return c.nodeEntries != 0;
 }
 
 ncclResult_t ncclTopoProbeLocal(const ncclPeerInfo* peer, ncclTopoLocalProbe probe, ncclXml** xml) {
@@ -331,6 +349,24 @@ ncclResult_t fuseContributions(const std::vector<ncclTopoSnapshot>& fragments, n
   *xmlOut = fused.release();
   return ncclSuccess;
 }
+
+ncclResult_t cacheFusedNode(struct ncclComm* comm, const std::vector<int>& localRanks,
+                            const std::vector<ContributionInfo>& info,
+                            const std::vector<ncclTopoSnapshot>& fragments, ncclXml* xml) {
+  int nLocalRanks = localRanks.size();
+  for (int i = 0; i < nLocalRanks; i++) ncclTopoCacheInsert(fragmentKey(info[i]), *fragments[i]);
+  // Store local slot numbers. The new comm's rank map is applied to a private
+  // copy on lookup, including non-contiguous DP ranks and reordered groups.
+  std::vector<int> toLocal(comm->nRanks, -1);
+  for (int i = 0; i < nLocalRanks; i++) toLocal[localRanks[i]] = i;
+  NCCLCHECK(mapRanks(xml, toLocal));
+  std::string packed;
+  ncclResult_t ret = ncclTopoPackXml(xml, &packed);
+  NCCLCHECK(mapRanks(xml, localRanks));
+  NCCLCHECK(ret);
+  ncclTopoCacheInsert(systemKey(info), packed);
+  return ncclSuccess;
+}
 } // namespace
 
 static ncclResult_t exchangeNodeXml(struct ncclComm* comm, std::vector<int>& localRanks, int localRank,
@@ -393,11 +429,13 @@ ncclResult_t ncclTopoGetNodeSnapshot(struct ncclComm* comm, ncclXml** xmlOut) {
     return exchangeNodeXml(comm, localRanks, comm->cliqueRank, xmlOut, nullptr);
   }
   int mode = 2;
+  bool anyWarm = false;
   for (int r = 0; r < comm->nRanks; r++) {
     if (comm->peerInfo[r].hostHash == comm->peerInfo[comm->rank].hostHash) {
       if (r == comm->rank) localRank = localRanks.size();
       localRanks.push_back(r);
       mode = std::min(mode, comm->peerInfo[r].topoCacheMode);
+      anyWarm |= comm->peerInfo[r].topoCacheWarm;
     }
   }
   // Negotiated through the existing peer-info AllGather. Even a rank with
@@ -405,6 +443,22 @@ ncclResult_t ncclTopoGetNodeSnapshot(struct ncclComm* comm, ncclXml** xmlOut) {
   if (mode < 2) return exchangeNodeXml(comm, localRanks, localRank, xmlOut, nullptr);
 
   int nLocalRanks = localRanks.size();
+  if (!anyWarm) {
+    // Cold start across all local participants: no rank holds a cached node or
+    // fragment entry yet, so skip pre-packing and both agreement AllGathers,
+    // run the single XML exchange directly, and warm the cache from it.
+    std::vector<ncclTopoSnapshot> fragments(nLocalRanks);
+    NCCLCHECK(exchangeNodeXml(comm, localRanks, localRank, xmlOut, &fragments));
+    std::vector<ContributionInfo> info(nLocalRanks);
+    for (int i = 0; i < nLocalRanks; i++) {
+      if (!fragments[i]) return ncclSuccess;
+      info[i] = contributionInfo(comm->peerInfo[localRanks[i]], *fragments[i], true);
+    }
+    NCCLCHECK(cacheFusedNode(comm, localRanks, info, fragments, *xmlOut));
+    for (int r : localRanks) comm->peerInfo[r].topoCacheWarm = true;
+    return ncclSuccess;
+  }
+
   std::string packed;
   bool eligible;
   NCCLCHECK(packContribution(*xmlOut, comm->rank, &packed, &eligible));
@@ -444,17 +498,7 @@ ncclResult_t ncclTopoGetNodeSnapshot(struct ncclComm* comm, ncclXml** xmlOut) {
       auto actual = contributionInfo(comm->peerInfo[localRanks[i]], *fragments[i], true);
       if (memcmp(actual.digest, info[i].digest, sizeof(actual.digest)) != 0) return ncclSuccess;
     }
-    for (int i = 0; i < nLocalRanks; i++) ncclTopoCacheInsert(fragmentKey(info[i]), *fragments[i]);
-    // Store local slot numbers. The new comm's rank map is applied to a private
-    // copy on lookup, including non-contiguous DP ranks and reordered groups.
-    std::vector<int> toLocal(comm->nRanks, -1);
-    for (int i = 0; i < nLocalRanks; i++) toLocal[localRanks[i]] = i;
-    NCCLCHECK(mapRanks(*xmlOut, toLocal));
-    ncclResult_t ret = ncclTopoPackXml(*xmlOut, &packed);
-    NCCLCHECK(mapRanks(*xmlOut, localRanks));
-    NCCLCHECK(ret);
-    ncclTopoCacheInsert(key, packed);
-    return ncclSuccess;
+    return cacheFusedNode(comm, localRanks, info, fragments, *xmlOut);
   }
 
   ncclXml* xml = nullptr;

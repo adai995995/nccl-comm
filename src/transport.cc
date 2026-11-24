@@ -431,10 +431,7 @@ bool ncclTransportCollNetSetup(struct ncclComm* comm, struct ncclTopoGraph* coll
   // connect
   if (isMaster) {
     NCCLCHECKGOTO(transportComm->connect(comm, masterConnects, nMasters, comm->node, conn), ret, cleanup);
-    struct ncclDevChannelPeer* devRoot;
-    CUDACHECKGOTO(cudaMemcpy(&devRoot, channel->devPeers + nranks, sizeof(struct ncclDevChannelPeer*),
-                             cudaMemcpyDeviceToHost),
-                  ret, cleanup);
+    struct ncclDevChannelPeer* devRoot = channel->devPeersHostPtr[nranks];
     struct ncclConnInfo* devConnInfo = (type == collNetRecv) ? devRoot->recv + type : devRoot->send + type;
     CUDACHECKGOTO(cudaMemcpy(devConnInfo, &conn->conn, sizeof(struct ncclConnInfo), cudaMemcpyHostToDevice), ret,
                   cleanup);

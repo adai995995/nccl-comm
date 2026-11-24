@@ -26,9 +26,12 @@ Concurrent first probes serialize publication, while callers modify separate XML
 
 The second step caches both per-device contributions and fused node snapshots.
 Contributions omit the owning comm rank but retain all other XML attributes,
-including the effective network view. Every initialization exchanges a small
-signature record and then a hit/miss vote. A single miss makes all ranks execute
-the original XML exchange; no cache lock is held across bootstrap calls.
+including the effective network view. When every local participant advertises a
+cold node cache via `ncclPeerInfo`, initialization skips the agreement rounds and
+warms the cache directly from the single XML exchange. Otherwise, initialization
+exchanges a small signature record and then a hit/miss vote. A single miss makes
+all ranks execute the original XML exchange; no cache lock is held across
+bootstrap calls.
 
 An identical ordered member set reuses a fused snapshot. A subset or reordered
 group selects cached contributions and fuses them in its own member order, then
@@ -51,6 +54,10 @@ reset recovery is not implemented. Use level 0 when physical reprobes are needed
 | `NCCL_TOPO_CACHE=1` | Local probe reuse, original node XML exchange |
 | `NCCL_TOPO_CACHE=2` (default) | Local probe and node snapshot reuse |
 | `NCCL_TOPO_CACHE_MAX_BYTES=67108864` (default) | LRU budget for retained snapshot data and entry/key accounting |
+| `NCCL_FABRIC_SHARE=1` (default) | Context-scoped `DeviceFabric` reuse across independent and split comms |
+| `NCCL_TOPO_ROUTE_MEMO=1` (default) | Slot-normalized `ncclTopoSystem` and Ring/Tree/CollNet/NVLS graph memoization |
+| `NCCL_BOOTSTRAP_SUBVIEW=1` (default) | Zero-socket multiplexed subviews for resource-sharing `ncclCommSplit` |
+| `NCCL_FAST_GROUP_COMPILE=1` (default) | `FabricAtlas` + `GroupCompiler` local synthesis of `AllGather1`/`AllGather3` on splits |
 
 The budget excludes allocator overhead and snapshots pinned by in-flight readers.
 A zero or insufficient budget disables retention; it does not fail comm creation.

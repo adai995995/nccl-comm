@@ -140,6 +140,7 @@ struct ncclSharedResources {
   struct ncclComm* owner; /* comm which creates this shared res. */
   struct ncclChannelPeer* peers[MAXCHANNELS];
   struct ncclDevChannelPeer* devPeers[MAXCHANNELS];
+  struct ncclDevChannelPeer* devPeersSlab;
   /* P2P operation counter, one per channel */
   uint64_t p2pOpCount[MAXCHANNELS];
   /* Collective operation counter */
@@ -590,6 +591,9 @@ struct ncclComm {
 
   struct ncclCudaContext* context;
   const struct ncclDeviceFacts* deviceFacts;
+  struct ncclCommDevMetaSlab* devMetaSlab;
+  struct ncclFabricAtlas* fabricAtlas;
+  int* atlasWorldRanks;
   struct ncclSharedResources* sharedRes;
   /* map to top parent ranks. */
   int* topParentRanks;
@@ -820,6 +824,14 @@ struct ncclComm {
 
   // Flag indicating if this communicator shares resources with parent or children
   bool shareResources;
+  bool fabricTicketHeld;
+  bool fabricBound;
+  bool topoSystemMemoHit;
+  struct ncclDeviceFabric* reservedFabric;
+  struct ncclDeviceFabric* boundFabric;
+  void* fabricLease;
+  uint32_t splitCompileFlags;
+  uint64_t topoNodeDigest[2];
 
   // Tuning plugin
   int tunerPluginLoaded;

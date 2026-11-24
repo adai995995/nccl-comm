@@ -20,6 +20,7 @@
 
 // ncclCudaContext: wraps a CUDA context with per-context state.
 struct ncclCudaContext;
+struct ncclDeviceFabric;
 
 // Get a ncclCudaContext to track the currently active CUDA context.
 ncclResult_t ncclCudaContextTrack(struct ncclCudaContext** out, int launchOrderImplicit, uint64_t commHash,
@@ -142,6 +143,8 @@ struct ncclCudaContext {
   std::mutex initMutex;
   std::condition_variable initCond;
   struct ncclKernelInfo kernels;
+  std::mutex fabricMutex;
+  struct ncclDeviceFabric* fabric;
   bool launchOrderImplicitEverEnabled;
   bool launchOrderImplicitEverDisabled;
   struct ncclStrongStream launchOrder;

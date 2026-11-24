@@ -10,6 +10,7 @@
 #include "graph.h"
 #include "topo.h"
 #include "topo_cache.h"
+#include "slot_route_memo.h"
 #include <cstring>
 #include "comm.h"
 #include "nccl.h"
@@ -2152,12 +2153,28 @@ exit:
 ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** system, const char* dumpXmlFile) {
   ncclResult_t ret = ncclSuccess;
   ncclXml* xml = nullptr;
+  comm->topoSystemMemoHit = false;
+  comm->topoNodeDigest[0] = comm->topoNodeDigest[1] = 0;
   NCCLCHECKGOTO(ncclTopoGetCommXml(comm, dumpXmlFile, &xml), ret, exit);
   if (dumpXmlFile && comm->rank == ncclParamTopoDumpFileRank()) {
     INFO(NCCL_ENV, "NCCL_TOPO_DUMP_FILE set by environment to %s", dumpXmlFile);
     NCCLCHECKGOTO(ncclTopoDumpXmlToFile(dumpXmlFile, xml), ret, exit);
   }
-  if (dumpXmlFile == nullptr) NCCLCHECKGOTO(ncclTopoBuildCommSystem(comm, xml, system), ret, exit);
+  if (dumpXmlFile == nullptr) {
+    if (!comm->MNNVL && ncclSlotRouteMemoEnabled() && system == &comm->topo) {
+      std::vector<int> localRanks;
+      for (int r = 0; r < comm->nRanks; r++) {
+        if (comm->peerInfo[r].hostHash == comm->peerInfo[comm->rank].hostHash) localRanks.push_back(r);
+      }
+      if (ncclTopoComputeNormalizedNodeDigest(xml, localRanks, comm->topoNodeDigest) == ncclSuccess) {
+        NCCLCHECKGOTO(ncclSlotRouteMemoTryGetSystem(comm, comm->topoNodeDigest, localRanks, &comm->topoSystemMemoHit),
+                      ret, exit);
+      }
+    }
+    if (!comm->topoSystemMemoHit) {
+      NCCLCHECKGOTO(ncclTopoBuildCommSystem(comm, xml, system), ret, exit);
+    }
+  }
 exit:
   free(xml);
   return ret;

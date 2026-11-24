@@ -52,9 +52,15 @@ static int launchOrderImplicitEffective(int launchOrderImplicit) {
 ncclResult_t ncclCudaContextTrack(struct ncclCudaContext** out, int launchOrderImplicit, uint64_t commHash,
                                   const ncclDeviceFacts* facts) {
   *out = nullptr;
-  CUcontext hcontext;
+  CUcontext hcontext = nullptr;
   CUCHECK(cuCtxGetCurrent(&hcontext));
-  if (hcontext == nullptr) return ncclInvalidUsage;
+  if (hcontext == nullptr) {
+    // On older runtimes cudaSetDevice alone need not make a primary context
+    // current on an async initialization thread. Materialize it only on demand.
+    CUDACHECK(cudaFree(nullptr));
+    CUCHECK(cuCtxGetCurrent(&hcontext));
+    if (hcontext == nullptr) return ncclInvalidUsage;
+  }
   int launchOrderImplicitEnabled = launchOrderImplicitEffective(launchOrderImplicit);
 
   std::unique_lock<std::mutex> lock(cxtListMutex);

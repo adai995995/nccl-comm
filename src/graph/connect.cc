@@ -12,6 +12,7 @@
 #include "trees.h"
 #include "rings.h"
 #include "topo.h"
+#include "fabric/device_fabric.h"
 
 #include <cmath>
 
@@ -406,7 +407,10 @@ ncclResult_t ncclTopoPostset(struct ncclComm* comm, int* firstRanks, int* treePa
   int symkNTreeChannels;
   int symkNTreeSearchChannels;
   int minHeadNum = INT_MAX;
-  int shared = parent && ncclNvlsTransportEnabled(parent) && parent->shareResources;
+  int shared = (parent && ncclNvlsTransportEnabled(parent) && parent->shareResources) || comm->fabricBound;
+  int maxSharedNvlsChannels = (parent && ncclNvlsTransportEnabled(parent) && parent->shareResources) ?
+                                parent->nvlsResources->nChannels :
+                                ncclDeviceFabricMaxNvlsChannels(comm);
   NCCLCHECK(ncclCalloc(&ringRecv, nNodes * MAXCHANNELS));
   NCCLCHECKGOTO(ncclCalloc(&ringSend, nNodes * MAXCHANNELS), ret, fail);
   NCCLCHECKGOTO(ncclCalloc(&ringPrev, nranks * MAXCHANNELS), ret, fail);
@@ -541,13 +545,13 @@ ncclResult_t ncclTopoPostset(struct ncclComm* comm, int* firstRanks, int* treePa
   comm->collChannels = comm->nChannels;
 #if CUDART_VERSION >= 12010
   // Support maximal channel usage for aggregation
-  if (shared && comm->nvlsChannels > parent->nvlsResources->nChannels) {
-    comm->nvlsChannels = parent->nvlsResources->nChannels;
+  if (shared && maxSharedNvlsChannels > 0 && comm->nvlsChannels > maxSharedNvlsChannels) {
+    comm->nvlsChannels = maxSharedNvlsChannels;
   }
   NCCLCHECKGOTO(connectNvls(comm, nvlsHeads, minHeadNum), ret, fail);
 #endif
-  if (shared && comm->nChannels > parent->sharedRes->tpNChannels) {
-    nChannels = comm->nChannels = parent->sharedRes->tpNChannels;
+  if (shared && comm->nChannels > comm->sharedRes->tpNChannels) {
+    nChannels = comm->nChannels = comm->sharedRes->tpNChannels;
     symkNRingChannels = std::min(symkNRingChannels, nChannels);
     symkNTreeChannels = std::min(symkNTreeChannels, nChannels);
     comm->collChannels = std::min(comm->collChannels, comm->nChannels);

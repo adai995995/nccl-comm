@@ -117,6 +117,7 @@ struct ncclProxyOp {
   ncclPid_t pid;
   void* profilerContext;
   uint64_t workCounter;
+  volatile uint32_t* commAbortFlag;
 
   struct ncclProxyOp* enqNext;
 };
@@ -207,6 +208,7 @@ struct ncclProxyArgs {
   struct ncclProxyArgs* next;
   struct ncclProxyArgs* nextPeer;
   struct ncclProxyArgs** proxyAppendPtr;
+  volatile uint32_t* commAbortFlag;
 
   union ncclProxyOpSpecifics specifics;
 };
@@ -348,6 +350,7 @@ struct ncclProxyState {
   ncclNet_t* ncclNet;
   ncclCollNet_t* ncclCollNet;
   uint32_t* abortFlag;
+  uint32_t serviceAbortFlag;
   bool directMode;
   struct ncclMemManager* memManager;  // Shared memory manager for proxy allocations
   // Service threads

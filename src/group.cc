@@ -12,6 +12,7 @@
 #include "transport.h"
 #include "channel.h"
 #include "bootstrap.h"
+#include "fabric/device_fabric.h"
 #include "ce_coll.h"
 #include "profiler.h"
 #include "nvtx.h"
@@ -292,11 +293,23 @@ ncclResult_t ncclPrepareTasksAndCollPreconnectFunc(struct ncclAsyncJob* job_) {
   return ncclSuccess;
 }
 
+static ncclResult_t ncclFabricRebuildJobFunc(struct ncclAsyncJob* job_) {
+  struct ncclPreconnectJob* job = (struct ncclPreconnectJob*)job_;
+  struct ncclComm* comm = job->comm;
+  CUDACHECK(cudaSetDevice(comm->cudaDev));
+  if (!job_->isThreadMain && ncclOsCpuCount(comm->cpuAffinity)) ncclOsSetAffinity(comm->cpuAffinity);
+  NCCLCHECK(ncclDeviceFabricRebuildComm(comm));
+  return ncclSuccess;
+}
+
 static ncclResult_t ncclTaskPrepareJobFunc(struct ncclAsyncJob* job_) {
   struct ncclTaskPrepareJob* job = (struct ncclTaskPrepareJob*)job_;
   struct ncclComm* comm = job->comm;
   CUDACHECK(cudaSetDevice(comm->cudaDev));
   if (!job_->isThreadMain && ncclOsCpuCount(comm->cpuAffinity)) ncclOsSetAffinity(comm->cpuAffinity);
+  if (!job->simInfo && ncclDeviceFabricNeedsRebuild(comm)) {
+    NCCLCHECK(ncclDeviceFabricRebuildComm(comm));
+  }
   NCCLCHECK(ncclTaskPrepare(comm, job->simInfo));
   return ncclSuccess;
 }
@@ -765,6 +778,48 @@ static ncclResult_t groupLaunchLegacy(struct ncclAsyncJob* job_, ncclSimInfo_t* 
   struct ncclComm* groupCommPreconnectHeadMain = gjob->groupCommPreconnectHead;
   struct ncclIntruQueue<struct ncclAsyncJob, &ncclAsyncJob::next>* asyncJobsMain = &gjob->asyncJobs;
   bool* groupAbortFlag = &gjob->abortFlag;
+  struct ncclIntruQueue<struct ncclAsyncJob, &ncclAsyncJob::next> asyncRebuildJobs;
+  struct ncclIntruQueue<struct ncclAsyncJob, &ncclAsyncJob::next> asyncPreconnectJobs;
+  ncclIntruQueueConstruct(&asyncRebuildJobs);
+  ncclIntruQueueConstruct(&asyncPreconnectJobs);
+
+  NCCLCHECKGOTO(asyncJobLaunch(asyncJobsMain, groupAbortFlag), ret, fail);
+
+  if (!simInfo) {
+    auto enqueueRebuildIfNeeded = [&](struct ncclComm* comm) -> ncclResult_t {
+      if (!ncclDeviceFabricNeedsRebuild(comm)) return ncclSuccess;
+      for (struct ncclAsyncJob* it = ncclIntruQueueHead(&asyncRebuildJobs); it != nullptr; it = it->next) {
+        if (((struct ncclPreconnectJob*)it)->comm == comm) return ncclSuccess;
+      }
+      struct ncclPreconnectJob* job;
+      NEW_NOTHROW(job, ncclPreconnectJob);
+      job->base.func = ncclFabricRebuildJobFunc;
+      job->base.undo = nullptr;
+      job->base.destructor = ncclPreconnectJobFree;
+      job->base.state = ncclGroupJobRunning;
+      job->base.abortFlag = comm->abortFlag;
+      job->base.abortFlagDev = comm->abortFlagDev;
+      job->comm = comm;
+      job->algoNeedConnect = nullptr;
+      ncclIntruQueueEnqueue(&asyncRebuildJobs, (struct ncclAsyncJob*)job);
+      return ncclSuccess;
+    };
+    for (int type = 0; type < ncclGroupTaskTypeNum; ++type) {
+      for (struct ncclComm* comm = groupCommHeadMain[type]; comm != nullptr; comm = comm->groupNext[type]) {
+        NCCLCHECKGOTO(enqueueRebuildIfNeeded(comm), ret, fail);
+      }
+    }
+    for (struct ncclComm* comm = groupCommPreconnectHeadMain; comm != nullptr; comm = comm->preconnectNext) {
+      NCCLCHECKGOTO(enqueueRebuildIfNeeded(comm), ret, fail);
+    }
+    if (!ncclIntruQueueEmpty(&asyncRebuildJobs)) {
+      NCCLCHECKGOTO(asyncJobLaunch(&asyncRebuildJobs, groupAbortFlag), ret, fail);
+      while (!ncclIntruQueueEmpty(&asyncRebuildJobs)) {
+        struct ncclAsyncJob* job = ncclIntruQueueDequeue(&asyncRebuildJobs);
+        if (job->destructor) job->destructor((void*)job);
+      }
+    }
+  }
 
   if (!simInfo && groupCommPreconnectHeadMain != nullptr) {
     struct ncclComm* comm = groupCommPreconnectHeadMain;
@@ -778,15 +833,19 @@ static ncclResult_t groupLaunchLegacy(struct ncclAsyncJob* job_, ncclSimInfo_t* 
       job->base.abortFlag = comm->abortFlag;
       job->base.abortFlagDev = comm->abortFlagDev;
       job->comm = comm;
-      ncclIntruQueueEnqueue(asyncJobsMain, (struct ncclAsyncJob*)job);
+      job->algoNeedConnect = nullptr;
+      ncclIntruQueueEnqueue(&asyncPreconnectJobs, (struct ncclAsyncJob*)job);
 
       struct ncclComm* next = comm->preconnectNext;
       comm->preconnectNext = reinterpret_cast<struct ncclComm*>(0x1);
       comm = next;
     } while (comm != nullptr);
+    NCCLCHECKGOTO(asyncJobLaunch(&asyncPreconnectJobs, groupAbortFlag), ret, fail);
+    while (!ncclIntruQueueEmpty(&asyncPreconnectJobs)) {
+      struct ncclAsyncJob* job = ncclIntruQueueDequeue(&asyncPreconnectJobs);
+      if (job->destructor) job->destructor((void*)job);
+    }
   }
-
-  NCCLCHECKGOTO(asyncJobLaunch(asyncJobsMain, groupAbortFlag), ret, fail);
 
   // only loop through sym alloc and register tasks
   for (int type = ncclGroupTaskTypeSymRegister; type <= ncclGroupTaskTypeSymRegister; ++type) {
@@ -918,6 +977,14 @@ static ncclResult_t groupLaunchLegacy(struct ncclAsyncJob* job_, ncclSimInfo_t* 
 exit:
   return ret;
 fail:
+  while (!ncclIntruQueueEmpty(&asyncRebuildJobs)) {
+    struct ncclAsyncJob* job = ncclIntruQueueDequeue(&asyncRebuildJobs);
+    if (job->destructor) job->destructor((void*)job);
+  }
+  while (!ncclIntruQueueEmpty(&asyncPreconnectJobs)) {
+    struct ncclAsyncJob* job = ncclIntruQueueDequeue(&asyncPreconnectJobs);
+    if (job->destructor) job->destructor((void*)job);
+  }
   groupCleanup(gjob->groupCommHead, &gjob->asyncJobs, ret);
   goto exit;
 }

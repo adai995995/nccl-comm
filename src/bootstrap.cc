@@ -484,6 +484,7 @@ ncclResult_t bcastGrowHandle(struct ncclBootstrapHandle* handle, struct ncclComm
 }
 
 struct unexConn {
+  uint64_t viewId;
   int peer;
   int tag;
   struct ncclSocket sock;
@@ -543,9 +544,19 @@ struct bootstrapState {
   ncclResult_t asyncSendError;
   bool asyncSendClosing; // rejects sends once drain/teardown begins
   bool asyncSendSetAbort; // async failure set abortFlag; report it once before abort cleanup
+  int refCount = 1;
+  bool isSubView = false;
+  struct bootstrapState* rootState = nullptr;
+  int* subToRootRank = nullptr;
+  uint64_t viewId = 0;
+  std::mutex acceptMutex;
+  std::condition_variable acceptCond;
+  bool acceptBusy = false;
 };
 #define STATE_RING(s, f) (s->ring.f)
 #define STATE_LISTEN(s, f) (s->listen.f)
+
+NCCL_PARAM(BootstrapSubView, "BOOTSTRAP_SUBVIEW", 1);
 
 // helper functions
 static ncclResult_t createListenSocket(struct ncclComm* comm, uint64_t magic, struct ncclSocket* socket,
@@ -984,6 +995,29 @@ ncclResult_t bootstrapSplit(uint64_t magic, struct ncclComm* comm, struct ncclCo
   comm->bootstrap = state;
   comm->magic = state->magic = magic;
 
+  if (parent->shareResources && !ncclParamBootstrapNetEnable() && ncclParamBootstrapSubView() != 0) {
+    struct bootstrapState* parentState = (struct bootstrapState*)parent->bootstrap;
+    struct bootstrapState* root = parentState->isSubView ? parentState->rootState : parentState;
+    ncclAtomicRefCountIncrement(&root->refCount);
+    state->isSubView = true;
+    state->rootState = root;
+    state->magic = root->magic;
+    state->viewId = (magic != 0) ? magic : 1ULL;
+    NCCLCHECKGOTO(ncclCalloc(&state->subToRootRank, nranks), ret, fail);
+    for (int i = 0; i < nranks; ++i) {
+      state->subToRootRank[i] = parentState->isSubView ? parentState->subToRootRank[parentRanks[i]] : parentRanks[i];
+      comm->topParentRanks[i] = parent->topParentRanks[parentRanks[i]];
+    }
+    if (ncclParamRasEnable() == 1) {
+      if (ncclRasCommInit(comm, nullptr) != ncclSuccess) {
+        INFO(NCCL_INIT | NCCL_RAS, "Continuing in spite of a RAS initialization error");
+      }
+    }
+    TRACE(NCCL_BOOTSTRAP, "bootstrapSplit SubView: comm %p parent %p rank %d nranks %d viewId 0x%lx",
+          comm, parent, rank, nranks, (unsigned long)state->viewId);
+    return ncclSuccess;
+  }
+
   prev = parentRanks[(rank - 1 + nranks) % nranks];
   next = parentRanks[(rank + 1) % nranks];
 
@@ -1059,7 +1093,47 @@ fail:
   goto exit;
 }
 
+ncclResult_t bootstrapSetupStandaloneProxy(struct ncclComm* comm) {
+  ncclResult_t ret = ncclSuccess;
+  int rank = comm->rank;
+  int nranks = comm->nRanks;
+  struct proxyEndpoint {
+    union ncclSocketAddress addr;
+    uint64_t uds;
+  }* endpoints = nullptr;
+  union ncclSocketAddress* peerProxyAddresses = nullptr;
+  uint64_t* peerProxyAddressesUDS = nullptr;
+  struct ncclSocket* proxySocket = nullptr;
+
+  NCCLCHECKGOTO(ncclCalloc(&endpoints, nranks), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&peerProxyAddresses, nranks), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&peerProxyAddressesUDS, nranks), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&proxySocket, 1), ret, fail);
+  NCCLCHECKGOTO(getUDS(&endpoints[rank].uds), ret, fail);
+  NCCLCHECKGOTO(createListenSocket(comm, comm->magic, proxySocket, &endpoints[rank].addr, ncclSocketTypeProxy), ret,
+                fail);
+  NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap, endpoints, sizeof(*endpoints)), ret, fail);
+  for (int r = 0; r < nranks; r++) {
+    peerProxyAddresses[r] = endpoints[r].addr;
+    peerProxyAddressesUDS[r] = endpoints[r].uds;
+  }
+  NCCLCHECKGOTO(ncclProxyInit(comm, proxySocket, peerProxyAddresses, peerProxyAddressesUDS), ret, fail);
+  free(endpoints);
+  return ncclSuccess;
+
+fail:
+  free(endpoints);
+  free(peerProxyAddresses);
+  free(peerProxyAddressesUDS);
+  if (proxySocket != nullptr) {
+    (void)ncclSocketClose(proxySocket);
+    free(proxySocket);
+  }
+  return ret;
+}
+
 struct socketAckInfo {
+  uint64_t viewId;
   int rank;
   int tag;
 };
@@ -1067,9 +1141,13 @@ struct socketAckInfo {
 static ncclResult_t socketConnect(void* commState, int peer, int tag, struct ncclSocket* sock) {
   ncclResult_t ret = ncclSuccess;
   struct bootstrapState* state = (struct bootstrapState*)commState;
+  struct bootstrapState* root = state->isSubView ? state->rootState : state;
+  int rootPeer = state->isSubView ? state->subToRootRank[peer] : peer;
+  uint64_t viewId = state->isSubView ? state->viewId : 0ULL;
+  int myRootRank = state->isSubView ? state->subToRootRank[state->rank] : state->rank;
 
-  struct socketAckInfo ack = (struct socketAckInfo){state->rank, tag};
-  NCCLCHECKGOTO(ncclSocketInit(sock, state->peerP2pAddresses + peer, state->magic, ncclSocketTypeBootstrap,
+  struct socketAckInfo ack = {viewId, myRootRank, tag};
+  NCCLCHECKGOTO(ncclSocketInit(sock, root->peerP2pAddresses + rootPeer, root->magic, ncclSocketTypeBootstrap,
                                state->abortFlag),
                 ret, fail);
   NCCLCHECKGOTO(ncclSocketConnect(sock), ret, fail);
@@ -1217,10 +1295,12 @@ fail:
 }
 
 // Bootstrap send/receive functions
-static ncclResult_t unexpectedEnqueue(struct bootstrapState* state, int peer, int tag, struct ncclSocket* sock) {
+static ncclResult_t unexpectedEnqueue(struct bootstrapState* state, uint64_t viewId, int peer, int tag,
+                                      struct ncclSocket* sock) {
   // New unex
   struct unexConn* unex;
   NCCLCHECK(ncclCalloc(&unex, 1));
+  unex->viewId = viewId;
   unex->peer = peer;
   unex->tag = tag;
   ncclSocketMove(&unex->sock, sock);
@@ -1235,14 +1315,14 @@ static ncclResult_t unexpectedEnqueue(struct bootstrapState* state, int peer, in
   list->next = unex;
   return ncclSuccess;
 }
-static ncclResult_t unexpectedDequeue(struct bootstrapState* state, int peer, int tag, struct ncclSocket* sock,
-                                      int* found) {
+static ncclResult_t unexpectedDequeue(struct bootstrapState* state, uint64_t viewId, int peer, int tag,
+                                      struct ncclSocket* sock, int* found) {
   struct unexConn* elem = state->unexpectedConnections;
   struct unexConn* prev = NULL;
   *found = 0;
   while (elem) {
     // peer < 0 means wildcard (accept from any peer)
-    if ((peer < 0 || elem->peer == peer) && elem->tag == tag) {
+    if (elem->viewId == viewId && (peer < 0 || elem->peer == peer) && elem->tag == tag) {
       if (prev == NULL) {
         state->unexpectedConnections = elem->next;
       } else {
@@ -1272,31 +1352,88 @@ static void unexpectedFree(struct bootstrapState* state) {
   return;
 }
 
+static int unexpectedFreeByView(struct bootstrapState* state, uint64_t viewId) {
+  struct unexConn* elem = state->unexpectedConnections;
+  struct unexConn* prev = NULL;
+  int removed = 0;
+  while (elem) {
+    struct unexConn* next = elem->next;
+    if (elem->viewId == viewId) {
+      if (prev == NULL) {
+        state->unexpectedConnections = next;
+      } else {
+        prev->next = next;
+      }
+      (void)ncclSocketClose(&elem->sock);
+      free(elem);
+      removed++;
+    } else {
+      prev = elem;
+    }
+    elem = next;
+  }
+  return removed;
+}
+
 // We can't know who we'll receive from, so we need to receive everything at once
 static ncclResult_t socketAccept(void* commState, int peer, int tag, struct ncclSocket* sock) {
   ncclResult_t ret = ncclSuccess;
   struct bootstrapState* state = (struct bootstrapState*)commState;
+  struct bootstrapState* root = state->isSubView ? state->rootState : state;
+  int rootPeer = (peer < 0 || !state->isSubView) ? peer : state->subToRootRank[peer];
+  uint64_t viewId = state->isSubView ? state->viewId : 0ULL;
 
-  // Search unexpected connections first
-  int found;
-  NCCLCHECK(unexpectedDequeue(state, peer, tag, sock, &found));
-  if (found) return ncclSuccess;
+  std::unique_lock<std::mutex> acceptLock(root->acceptMutex);
+  for (;;) {
+    int found = 0;
+    NCCLCHECK(unexpectedDequeue(root, viewId, rootPeer, tag, sock, &found));
+    if (found) return ncclSuccess;
 
-  // Then look for new connections
-  while (1) {
+    if (COMPILER_ATOMIC_LOAD(state->abortFlag, std::memory_order_acquire) != 0) {
+      return ncclInternalError;
+    }
+
+    if (root->acceptBusy) {
+      // Another view/thread is actively accepting on root's peerSocket; release
+      // the lock so incoming connections for other views can be enqueued and woken.
+      root->acceptCond.wait_for(acceptLock, std::chrono::milliseconds(20));
+      continue;
+    }
+
+    root->acceptBusy = true;
+    acceptLock.unlock();
+
+    struct ncclSocket tmpSock;
     struct socketAckInfo ack = {0};
-    NCCLCHECKGOTO(ncclSocketInit(sock), ret, fail);
-    NCCLCHECKGOTO(ncclSocketAccept(sock, &STATE_LISTEN(state, peerSocket)), ret, fail);
-    NCCLCHECKGOTO(socketRecv(sock, &ack, sizeof(struct socketAckInfo)), ret, fail);
-    // Match: tag must match, and peer must match (peer < 0 means wildcard)
-    if (ack.tag == tag && (peer < 0 || ack.rank == peer)) return ncclSuccess;
-    // No match: queue for later and try next connection
-    NCCLCHECKGOTO(unexpectedEnqueue(state, ack.rank, ack.tag, sock), ret, fail);
+    ret = ncclSocketInit(&tmpSock);
+    if (ret == ncclSuccess) {
+      ret = ncclSocketAccept(&tmpSock, &STATE_LISTEN(root, peerSocket));
+    }
+    if (ret == ncclSuccess) {
+      ret = socketRecv(&tmpSock, &ack, sizeof(struct socketAckInfo));
+    }
+
+    acceptLock.lock();
+    root->acceptBusy = false;
+    if (ret != ncclSuccess) {
+      (void)ncclSocketClose(&tmpSock);
+      root->acceptCond.notify_all();
+      return ret;
+    }
+
+    if (ack.viewId == viewId && ack.tag == tag && (rootPeer < 0 || ack.rank == rootPeer)) {
+      ncclSocketMove(sock, &tmpSock);
+      root->acceptCond.notify_all();
+      return ncclSuccess;
+    }
+
+    ret = unexpectedEnqueue(root, ack.viewId, ack.rank, ack.tag, &tmpSock);
+    root->acceptCond.notify_all();
+    if (ret != ncclSuccess) {
+      (void)ncclSocketClose(&tmpSock);
+      return ret;
+    }
   }
-  return ncclSuccess;
-fail:
-  (void)ncclSocketClose(sock);
-  return ret;
 }
 
 // We can't know who we'll receive from, so we need to receive everything at once
@@ -1410,11 +1547,51 @@ static ncclResult_t socketRingAllGather(struct ncclSocket* nextSock, struct nccl
 exit:
   return res;
 }
+// Like the ring connect: connecting to next and accepting from prev must make
+// progress together once the connect includes a TLS handshake.
+struct bootstrapPeerSocketOp {
+  void* commState;
+  int peer;
+  int tag;
+  struct ncclSocket* sock;
+};
+static ncclResult_t bootstrapPeerConnectOp(void* opaque) {
+  struct bootstrapPeerSocketOp* op = (struct bootstrapPeerSocketOp*)opaque;
+  NCCLCHECK(socketConnect(op->commState, op->peer, op->tag, op->sock));
+  return ncclSuccess;
+}
+static ncclResult_t bootstrapPeerAcceptOp(void* opaque) {
+  struct bootstrapPeerSocketOp* op = (struct bootstrapPeerSocketOp*)opaque;
+  NCCLCHECK(socketAccept(op->commState, op->peer, op->tag, op->sock));
+  return ncclSuccess;
+}
+
 ncclResult_t bootstrapAllGather(void* commState, void* allData, int size) {
   ncclResult_t res = ncclSuccess;
   struct bootstrapState* state = (struct bootstrapState*)commState;
   int rank = state->rank;
   int nranks = state->nranks;
+
+  if (state->isSubView) {
+    if (nranks <= 1) return ncclSuccess;
+    int prevRank = (rank - 1 + nranks) % nranks;
+    int nextRank = (rank + 1) % nranks;
+    struct ncclSocket recvSocket, sendSocket;
+    struct bootstrapPeerSocketOp connectOp = {commState, nextRank, BOOTSTRAP_TAG_ALLGATHER, &sendSocket};
+    struct bootstrapPeerSocketOp acceptOp = {commState, prevRank, BOOTSTRAP_TAG_ALLGATHER, &recvSocket};
+    NCCLCHECK(ncclSocketInit(&recvSocket));
+    NCCLCHECKGOTO(ncclSocketInit(&sendSocket), res, subview_fail);
+    NCCLCHECKGOTO(bootstrapConcurrent(bootstrapPeerConnectOp, &connectOp, bootstrapPeerAcceptOp, &acceptOp), res,
+                  subview_fail);
+    NCCLCHECKGOTO(socketRingAllGather(&sendSocket, &recvSocket, rank, nranks, (char*)allData, size), res, subview_fail);
+    NCCLCHECKGOTO(ncclSocketClose(&sendSocket), res, subview_fail);
+    NCCLCHECKGOTO(ncclSocketClose(&recvSocket), res, subview_fail);
+    return ncclSuccess;
+  subview_fail:
+    (void)ncclSocketClose(&sendSocket);
+    (void)ncclSocketClose(&recvSocket);
+    return res;
+  }
 
   TRACE(NCCL_BOOTSTRAP, "rank %d nranks %d size %d - AllGather", rank, nranks, size);
 
@@ -1469,25 +1646,6 @@ ncclResult_t bootstrapBarrier(void* commState, int rank, int nranks, int tag) {
   NCCLCHECK(bootstrapP2PBarrier(commState, NULL, rank, nranks, tag));
   BOOTSTRAP_PROF_CLOSE(time);
   TRACE(NCCL_BOOTSTRAP | NCCL_PROFILE, "bootstrapBarrier done in %f sec", time / 1e9);
-  return ncclSuccess;
-}
-
-// Like the ring connect: connecting to next and accepting from prev must make
-// progress together once the connect includes a TLS handshake.
-struct bootstrapPeerSocketOp {
-  void* commState;
-  int peer;
-  int tag;
-  struct ncclSocket* sock;
-};
-static ncclResult_t bootstrapPeerConnectOp(void* opaque) {
-  struct bootstrapPeerSocketOp* op = (struct bootstrapPeerSocketOp*)opaque;
-  NCCLCHECK(socketConnect(op->commState, op->peer, op->tag, op->sock));
-  return ncclSuccess;
-}
-static ncclResult_t bootstrapPeerAcceptOp(void* opaque) {
-  struct bootstrapPeerSocketOp* op = (struct bootstrapPeerSocketOp*)opaque;
-  NCCLCHECK(socketAccept(op->commState, op->peer, op->tag, op->sock));
   return ncclSuccess;
 }
 
@@ -1555,17 +1713,9 @@ ncclResult_t bootstrapBroadcast(void* commState, int rank, int nranks, int root,
   return ncclSuccess;
 }
 
-ncclResult_t bootstrapClose(void* commState) {
-  if (commState == NULL) return ncclSuccess;
-  struct bootstrapState* state = (struct bootstrapState*)commState;
-  // In-flight asynchronous sends reference this state; let them finish before
-  // tearing it down. On abort they exit quickly via the abort flag.
-  ncclResult_t asyncSendError = bootstrapAsyncSendDrain(state);
-  if (asyncSendError != ncclSuccess && (COMPILER_ATOMIC_LOAD(state->abortFlag, std::memory_order_acquire) == 0 ||
-                                        COMPILER_ATOMIC_LOAD(&state->asyncSendSetAbort, std::memory_order_relaxed))) {
-    WARN("bootstrapClose: an asynchronous bootstrap send failed");
-    COMPILER_ATOMIC_STORE(&state->asyncSendSetAbort, false, std::memory_order_relaxed);
-    return asyncSendError;
+static ncclResult_t bootstrapReleaseRoot(struct bootstrapState* state) {
+  if (ncclAtomicRefCountDecrement(&state->refCount) != 0) {
+    return ncclSuccess;
   }
   // close unexpected and return an error if we are not aborting and still operations in the pipe
   if (state->unexpectedConnections != NULL) {
@@ -1591,4 +1741,40 @@ ncclResult_t bootstrapClose(void* commState) {
   free(state->peerP2pAddresses);
   delete state;
   return ncclSuccess;
+}
+
+ncclResult_t bootstrapClose(void* commState) {
+  if (commState == NULL) return ncclSuccess;
+  struct bootstrapState* state = (struct bootstrapState*)commState;
+  // In-flight asynchronous sends reference this state; let them finish before
+  // tearing it down. On abort they exit quickly via the abort flag.
+  ncclResult_t asyncSendError = bootstrapAsyncSendDrain(state);
+  bool reportAsyncErr =
+    (asyncSendError != ncclSuccess && (COMPILER_ATOMIC_LOAD(state->abortFlag, std::memory_order_acquire) == 0 ||
+                                       COMPILER_ATOMIC_LOAD(&state->asyncSendSetAbort, std::memory_order_relaxed)));
+  if (reportAsyncErr) {
+    WARN("bootstrapClose: an asynchronous bootstrap send failed");
+    COMPILER_ATOMIC_STORE(&state->asyncSendSetAbort, false, std::memory_order_relaxed);
+  }
+  if (state->isSubView) {
+    struct bootstrapState* root = state->rootState;
+    uint64_t viewId = state->viewId;
+    bool aborted = (COMPILER_ATOMIC_LOAD(state->abortFlag, std::memory_order_acquire) != 0);
+    int leftover = 0;
+    {
+      std::lock_guard<std::mutex> lock(root->acceptMutex);
+      leftover = unexpectedFreeByView(root, viewId);
+    }
+    free(state->subToRootRank);
+    delete state;
+    ncclResult_t rootRes = bootstrapReleaseRoot(root);
+    if (reportAsyncErr) return asyncSendError;
+    if (leftover > 0 && !aborted) {
+      WARN("Unexpected connections are not empty for subview");
+      return ncclInternalError;
+    }
+    return rootRes;
+  }
+  if (reportAsyncErr) return asyncSendError;
+  return bootstrapReleaseRoot(state);
 }

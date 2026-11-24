@@ -433,6 +433,7 @@ static ncclResult_t ncclProxyOpToArgs(struct ncclProxyOp* op, struct ncclProxyAr
   args->state = ncclProxyOpReady;
   args->progress = op->connection->tcomm->proxyProgress;
   args->proxyAppendPtr = op->connection->proxyAppendPtr;
+  args->commAbortFlag = op->commAbortFlag;
 exit:
   ncclProfilerStartProxyOpEvent(subIndex, args);
   return ncclSuccess;
@@ -445,7 +446,7 @@ static ncclResult_t ProxyAppend(struct ncclProxyState* proxyState, struct ncclPr
   struct ncclProxyArgs* args = *connection->proxyAppendPtr;
 
   if (args) {
-    if (shared && args->opCount == op->opCount) {
+    if (shared && args->opCount == op->opCount && args->commAbortFlag == op->commAbortFlag) {
       NCCLCHECK(ncclProxyOpToArgs(op, args, args->nsubs, proxyState->profilerContext));
       DEBUG_PROXY_PRINT("Insert (%d/%5ld/%5ld) as group with %5ld\n", shared, args->opCount, op->opCount,
                         OP_INDEX(args));
@@ -521,6 +522,7 @@ static ncclResult_t ncclLocalOpAppend(struct ncclComm* comm, struct ncclProxyCon
   if (proxyOp->ringAlgo) proxyOp->ringAlgo->incRefCount();
   op->next = -1;
   op->connection = proxyConn->connection;
+  op->commAbortFlag = comm->abortFlag;
   if (proxyOps->nextOps == -1) {
     proxyOps->nextOps = proxyOps->nextOpsEnd = opIndex;
   } else {
@@ -805,6 +807,14 @@ static ncclResult_t progressOps(struct ncclProxyState* proxyState, struct ncclPr
   ncclResult_t status = ncclSuccess;
   while (op) {
     if (op->state == ncclProxyOpNone) return ncclInternalError;
+    if (op->commAbortFlag != nullptr && COMPILER_ATOMIC_LOAD(op->commAbortFlag, std::memory_order_acquire) != 0) {
+      for (int s = 0; s < op->nsubs; s++) {
+        if (op->subs[s].ringAlgo && op->subs[s].ringAlgo->decRefCount() == 0) delete op->subs[s].ringAlgo;
+        op->subs[s].ringAlgo = NULL;
+      }
+      NCCLCHECK(removeOp(state, &op, &prevOp));
+      continue;
+    }
     TIME_START(0);
     TIME_START(1);
     ncclResult_t ret = op->progress(proxyState, op);
@@ -882,8 +892,14 @@ process_nextops:
     lastPeer = peer;
     if (peerOp->connection == NULL) return ncclInternalError;
     if (peerOp->next != -1) COMPILER_PREFETCH(pool->ops + peerOp->next);
-    NCCLCHECK(ProxyAppend(proxyState, peerOp));
-    (*added)++;
+    if (peerOp->commAbortFlag != nullptr &&
+        COMPILER_ATOMIC_LOAD(peerOp->commAbortFlag, std::memory_order_acquire) != 0) {
+      if (peerOp->ringAlgo && peerOp->ringAlgo->decRefCount() == 0) delete peerOp->ringAlgo;
+      peerOp->ringAlgo = NULL;
+    } else {
+      NCCLCHECK(ProxyAppend(proxyState, peerOp));
+      (*added)++;
+    }
     int lastOpIndex = opIndex;
     opIndex = peerOp->next;
     // Return op to peer pool
@@ -1216,6 +1232,7 @@ ncclResult_t ncclProxyConnect(struct ncclComm* comm, int transport, int send, in
     NCCLCHECK(ncclSocketInit(sock, sharedProxyState->peerAddresses + proxyConn->tpRank, comm->sharedRes->magic,
                              ncclSocketTypeProxy, comm->abortFlag));
     NCCLCHECK(ncclSocketConnect(sock));
+    sock->abortFlag = &sharedProxyState->serviceAbortFlag;
   }
 
   struct ncclProxyInitReq req = {0};
@@ -2173,6 +2190,9 @@ ncclResult_t ncclProxyStop(struct ncclComm* comm) {
     struct ncclProxyState* sharedProxyState = comm->proxyState;
 
     if ((comm->proxyRefCountOld = ncclAtomicRefCountDecrement(&sharedProxyState->refCount)) == 0) {
+      if (COMPILER_ATOMIC_LOAD(comm->abortFlag, std::memory_order_acquire) != 0) {
+        COMPILER_ATOMIC_STORE(&sharedProxyState->serviceAbortFlag, 1u, std::memory_order_release);
+      }
       if (COMPILER_ATOMIC_LOAD(comm->abortFlag, std::memory_order_acquire) == 0 && sharedProxyState->peerAddresses) {
         // We need to send a ncclProxyMsgStop message to our own proxy
         struct ncclSocket sock;

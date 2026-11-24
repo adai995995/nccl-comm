@@ -39,6 +39,7 @@ configure_file(
 
 # Add files from subdirectories
 add_subdirectory(config)
+add_subdirectory(fabric)
 add_subdirectory(transport)
 add_subdirectory(misc)
 add_subdirectory(register)
@@ -72,6 +73,7 @@ endif()
 # Add all source files
 list(APPEND LIBSRCFILES
     ${CONFIG_SOURCES}
+    ${FABRIC_SOURCES}
     ${TRANSPORT_SOURCES}
     ${MISC_SOURCES}
     ${REGISTER_SOURCES}

@@ -18,6 +18,7 @@ struct ncclPeerInfo;
 // Process-local, immutable CPU snapshots. No CUDA context, communicator or
 // network-plugin handles are retained. Every caller receives a private XML.
 int ncclTopoCacheMode();
+bool ncclTopoNodeCacheWarm();
 using ncclTopoLocalProbe = ncclResult_t (*)(int64_t busId, const char* topoFile, ncclXml* xml);
 ncclResult_t ncclTopoProbeLocal(const ncclPeerInfo* peer, ncclTopoLocalProbe probe, ncclXml** xml);
 

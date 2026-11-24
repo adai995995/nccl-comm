@@ -2,6 +2,7 @@
 set(GRAPH_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/topo.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/topo_cache.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/slot_route_memo.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/xml.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/search.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/paths.cc

@@ -76,6 +76,10 @@ struct ncclPeerInfo {
   uint32_t cftUnicastCliqueId;
   uint32_t cftMulticastCliqueId;
   int topoCacheMode; // Negotiate node snapshot reuse in the existing peer-info exchange.
+  bool topoCacheWarm; // True once this process retains any node/fragment snapshot.
+  uint64_t rawHostHash;
+  uint64_t rawPidHash;
+  uint64_t fabricCandidateId;
 };
 
 #define CONNECT_SIZE 256
@@ -117,6 +121,8 @@ struct ncclNvlsSharedRes {
   int treeMaxChunkSize;
   struct ncclShmemCollBuff nvlsShmem;
   void* nvlsShmemHandle;
+  struct ncclChannelPeer* nvlsPeersSlab;
+  struct ncclDevChannelPeer* nvlsDevPeersSlab;
 };
 
 #endif /* CUDART_VERSION >= 12010 */
